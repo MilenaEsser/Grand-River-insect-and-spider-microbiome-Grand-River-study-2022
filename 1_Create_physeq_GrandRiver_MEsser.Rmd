@@ -544,7 +544,7 @@ s7 <- subset_taxa(s6,                                            # unclassified 
                   !is.na(Phylum) &
                     !Phylum %in% c("", "uncharacterized", "NA"))
 
-# Sanity check: s7 should be identical to ps_filt from the main script
+# check s7 should be identical to ps_filt from the main script
 stopifnot(identical(sample_sums(s7), sample_sums(ps_filt)))
 
 contam_ids <- rownames(contamdf.prev)[contamdf.prev$contaminant]  # decontam
@@ -621,11 +621,6 @@ write.csv(track, file.path(output_dir, "TableS_read_tracking_per_sample.csv"),
 write.csv(track_summary, file.path(output_dir, "TableS_read_tracking_summary.csv"),
           row.names = FALSE)
 
-if (requireNamespace("openxlsx", quietly = TRUE)) {
-  openxlsx::write.xlsx(list("Per sample" = track, "Summary" = track_summary),
-                       file.path(output_dir, "TableS_read_tracking.xlsx"),
-                       keepNA = FALSE)
-}
 ```
 
 ### Proportion normalization
