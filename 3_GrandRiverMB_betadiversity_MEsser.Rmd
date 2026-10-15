@@ -1,0 +1,756 @@
+---
+title: "Grand River 2022 - microbiome beta diversity analysis"
+author: "Milena Esser"
+date: "2025-05-20"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r 3-setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+rm(list=ls()) 
+par(mar = c(2, 2, 2, 2)) 
+
+# packages
+library(phyloseq) 
+library(ggplot2)
+library(ggtext)
+library(plyr) 
+library(dplyr) 
+library(vegan)
+library(tidyverse) 
+library(knitr) 
+library(RColorBrewer)
+library(ggpubr)
+#library(MicEco) #to prune based on prevalence
+library(picante)
+library(ggh4x)
+library(multcompView)
+library(microbiome) 
+library(rdacca.hp) #package for hierarchical and variation partitioning in multiple regression and canonical ananlysis
+library(data.table)
+```
+
+```{r Loading data}
+
+
+#not rarefied dataset "Bow_ps"
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_unnorm.RData")
+
+#rarefied dataset "ps_rare"
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_rar.RData")
+
+#css-normalized dataset "ps_css"
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_css.RData")
+
+#TSS-normalized dataset "ps_prop"
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_propnorm.RData")
+```
+
+```{r select-data-for-beta}
+dataset <- "css"
+ps <- get(paste0("ps_", dataset))
+
+# Create output directory
+output_dir <- paste0("R_output/Beta_diversity/", dataset) 
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+###  PCoA Bray Curtis - ALL SAMPLES
+
+Performed Principal Coordinates Analysis (PCoA) on the phyloseq object using Bray-Curtis distance. This method reduces multidimensional microbial community data into principal axes to visualize sample similarities.
+
+***PCoA plot***
+
+```{r Plot-PCoA}
+
+bray <- ordinate(ps, method = "PCoA", distance = "bray")
+
+metadata<- data.frame(sample_data(ps))
+
+metadata$Site_ID <- factor(metadata$Site_ID)
+metadata$Sample_Type <- factor(metadata$Sample_Type)
+
+#All together
+shape_values <- c(0, 1, 2, 3, 4, 5, 6, 7)
+
+p <- plot_ordination(ps, bray, shape = "Site_ID", color = "Sample_Type") +
+  scale_shape_manual(values = shape_values) +
+  theme_classic()
+
+p
+#save plot
+filename <- file.path(output_dir, paste0("PCoA_Bray_ALLsamples_", dataset, ".png"))
+ggsave(filename = filename, height = 5, width = 7)
+
+#Faceted by stage (larvae, adults, spiders)
+#plot_ordination(ps, bray, shape="Site_ID", color="Sample_Type") + 
+#  theme_classic() +
+#  theme(strip.background = element_blank())+
+#  facet_wrap(~Sample_Type)
+
+```
+
+### NMDS Bray Curtis -ALL SAMPLES
+
+I looked at 2D (k=2) and 3D (k=3) NMDS
+
+Interpretation of stress values:
+
+- \< 0.05 = excellent,
+
+- 0.05–0.1 = very good,
+
+- 0.1–0.2 = usable but some distortion,
+
+- \> 0.2 = not reliable
+
+Weak ties mean that few identical distances were tied during ranking, which is good, it indicates the data have good variability.
+
+```{r NMDS-all-samples}
+# NMDS 
+set.seed(501)
+# Run NMDS with k=3
+ord_NMDS_k3 <- ordinate(ps, method = "NMDS", distance = "bray", trymax = 100, k = 3)
+cat("NMDS with k=3 results:\n")
+cat("Stress value:", ord_NMDS_k3$stress, "\n")
+
+
+# Run NMDS with k=2
+ord_NMDS_k2 <- ordinate(ps, method = "NMDS", distance = "bray", trymax = 100, k = 2)
+cat("NMDS with k=2 results:\n")
+cat("Stress value:", ord_NMDS_k2$stress, "\n")
+
+#Weak ties mean that few identical distances were tied during ranking, which is good it indicates the data have good variability.
+
+```
+
+Based on stress values, I continued with:
+
+```{r select-NMDS-model}
+
+selected_model_name <- "ord_NMDS_k2"
+ord_NMDS <- ord_NMDS_k2
+
+cat("Selected model:", selected_model_name, "; Stress value:", ord_NMDS$stress, "\n")
+```
+
+```{r plotting-NMDS, fig.height=10, fig.width=14, message=FALSE}
+#Plotting all sites and taxa in one facet
+plotNMDS1<-plot_ordination(ps, ord_NMDS, shape="Site_ID", color = "Sample_Type") + 
+  theme_classic() +
+  geom_point(size=3)+
+  theme(strip.background = element_blank())+
+  theme(legend.key.size = unit(0.3, 'cm'), 
+        legend.title = element_text(size=20), 
+        legend.text = element_text(size=18), 
+        axis.text = element_text(size=16, color="black"),
+        axis.title = element_text(size=18, color="black"),
+        legend.position = "right")+
+  guides(color=guide_legend(title="Invertebrate Taxa")) +
+  scale_color_discrete(palette(c("orange","blue","red","black","magenta","peachpuff")))
+
+
+newtab1 = data.table(plotNMDS1$data)
+newtab1$Family <- ordered(newtab1$Family,
+ levels=c("aeshnidae", "heptageniidae", "chironomidae", "zygoptera", "araneidae", "tetragnathidae"), labels=c("Aeshnidae", "Heptageniidae", "Chironomidae", "Zygoptera", "Araneidae", "Tetragnathidae"))
+plotNMDS1$data <- newtab1
+print(plotNMDS1)
+
+#save plot
+filename <- file.path(output_dir, paste0("NMDS_Bray_ALLsamples_", dataset, ".png"))
+ggsave(filename = filename, height = 10, width = 14)
+
+#Ellipses by taxa
+plotNMDStaxa<-plot_ordination(ps, ord_NMDS, color = "Sample_Type", shape="Site_ID") + 
+  theme_classic() +
+  geom_point(size=3)+
+  theme(strip.background = element_blank())+
+  theme(legend.key.size = unit(0.3, 'cm'), 
+        legend.title = element_text(size=20), 
+        legend.text = element_text(size=18), 
+        axis.text = element_text(size=16, color="black"),
+        axis.title = element_text(size=18, color="black"),
+        legend.position = "right")+
+  guides(color=guide_legend(title="Invertebrate Taxa")) +
+  scale_color_discrete(palette(c("orange","blue","red","black","magenta","peachpuff")))+
+  stat_ellipse(type="norm", alpha=1, aes(group=Sample_Type, color=Sample_Type))
+
+#newtabtaxa = data.table(plotNMDStaxa$data)
+#newtabtaxa$taxgroup <- ordered(newtabtaxa$taxgroup,
+#levels=c("aeshnidae", "heptageniidae", "chironomidae", "zygoptera", "araneidae", "tetragnathidae"), labels=c("Aeshnidae", "Heptageniidae", "Chironomidae", "Zygoptera", "Araneidae", "Tetragnathidae"))
+#plotNMDStaxa$data <- newtabtaxa
+print(plotNMDStaxa)
+
+#save plot
+filename <- file.path(output_dir, paste0("NMDS_Bray_ALLsamples_elipses_", dataset, ".png"))
+ggsave(filename = filename, height = 10, width = 14)
+
+
+#Ellipses by Site
+plotNMDSsite<-plot_ordination(ps, ord_NMDS, color = "Sample_Type", shape="Site_ID") + 
+  theme_classic() +
+  geom_point(size=3)+
+  theme(strip.background = element_blank())+
+  theme(legend.key.size = unit(0.3, 'cm'), 
+        legend.title = element_text(size=20), 
+        legend.text = element_text(size=18), 
+        axis.text = element_text(size=16, color="black"),
+        axis.title = element_text(size=18, color="black"),
+        legend.position = "right")+
+  guides(color=guide_legend(title="Invertebrate Taxa")) +
+  scale_color_discrete(palette(c("orange","blue","red","black","magenta","peachpuff")))+
+  stat_ellipse(type="norm", alpha=1, aes(group=Site_ID))
+
+#newtabtaxa = data.table(plotNMDSsite$data)
+#newtabtaxa$taxgroup <- ordered(newtabtaxa$taxgroup,
+#levels=c("aeshnidae", "heptageniidae", "chironomidae", "zygoptera", "araneidae", "tetragnathidae"), labels=c("Aeshnidae", "Heptageniidae", "Chironomidae", "Zygoptera", "Araneidae", "Tetragnathidae"))
+#plotNMDSsite$data <- newtabtaxa
+print(plotNMDSsite)
+
+#save plot
+filename <- file.path(output_dir, paste0("NMDS_Bray_ALLsamples_EllipsesSITE_", dataset, ".png"))
+ggsave(filename = filename, height = 10, width = 14)
+
+
+
+```
+
+#### Statistics
+
+##### PERMANOVA
+
+```{r PERMANOVA-all-samples-together}
+# Create Bray-Curtis distance matrix
+df_bray <- phyloseq::distance(ps, method = "bray")
+
+#PERMANOVA testing for effects of Site and Sample Type on community composition
+test.adonis.all <- adonis2(df_bray ~ Site_ID * Sample_Type, data = metadata)
+
+
+test.adonis.all<-adonis2(
+  df_bray ~ Taxa/Lifestage + Location,
+  data = metadata,
+  permutations = 999,
+  by = "margin",
+  strata = metadata$Site
+)
+
+# Print a clean, reader-friendly summary for the report
+cat("PERMANOVA Results for Bray-Curtis Distance:\n")
+cat("Testing effects of Taxa (with Lifestage nested within Taxa) and Location on microbial community composition,\nwhile accounting for repeated measures within Site (strata = Site) using PERMANOVA.\n\n")
+
+# Format the output nicely
+adonis_table <- as.data.frame(test.adonis.all)
+
+print(adonis_table)
+
+cat("\nInterpretation:\n")
+cat("- Significant p-values (< 0.05) indicate a statistically significant effect of that factor on community composition.\n")
+cat("- R² values represent the proportion of variation explained by each factor.\n")
+```
+
+##### Beta dispersion
+
+betadisper measures the spread (i.e., variability) of samples around the group centroid in NMDS (or distance) space. It’s analogous to a Levene’s test for homogeneity of variance, but for multivariate data. It helps to understand if your PERMANOVA results are driven more by location (centroid differences) or spread (dispersion differences).
+
+If dispersions differ too much, you have to be cautious in interpreting PERMANOVA results. As this is highly significant: Differences in microbial composition among Families are not only due to changes in the mean community but also because some Families are more variable than others.
+
+- **If p \> 0.05**: No evidence of unequal dispersion → can trust group separation in PERMANOVA.
+- **If p \< 0.05**: Significant dispersion → Group differences in PERMANOVA **may be confounded** by group variance, **not just location**.
+
+```{r beta-dispersion-all-samples-together}
+
+#Are microbial (or community) compositions more variable in some Families than in others?
+metadata$Sample_Type_Site <- paste(metadata$Sample_Type, metadata$Site, sep = "_")
+bd_all_fam <- betadisper(df_bray, metadata$Sample_Type_Site)
+anova(bd_all_fam)
+
+#Boxplot to show dispersion
+# Extract distances to centroids
+beta_df <- data.frame(
+  Family = bd_all_fam$group,
+  DistanceToCentroid = bd_all_fam$distances
+)
+
+# Show first few rows to verify structure
+cat("Summary of distances to group centroids:\n")
+print(head(beta_df))
+
+```
+
+In case of p\< 0.05: pairwise comparison to identify group with significantly different dispersion
+
+```{r tukey-to-identify-sig-diff-dispersion}
+tukey_res <- TukeyHSD(bd_all_fam)
+sig_disp <- as.data.frame(tukey_res$group)
+sig_disp$Comparison <- rownames(sig_disp)
+sig_disp <- sig_disp[sig_disp$`p adj` < 0.05, ]
+
+# View the significant ones
+cat("All significant results:\n")
+sig_disp[order(sig_disp$`p adj`), ]
+```
+
+Create boxplot
+
+```{r beta-dispersion-boxplot-all, fig.height=5, fig.width=8}
+# Create a ggplot boxplot
+ggplot(beta_df, aes(x = Family, y = DistanceToCentroid, fill = Family)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "black", outlier.size = 1.5) +
+  geom_jitter(width = 0.2, alpha=0.5, size=1.5) + # add jittered points
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size=12),
+    axis.text.y = element_text(size=12),
+    axis.title = element_text(size=14, face="bold"),
+    legend.position = "none"
+  ) +
+  labs(
+    x = "Family",
+    y = "Distance to Group Centroid",
+ #   title = "Beta Dispersion across Invertebrate Families"
+  ) +
+  scale_fill_brewer(palette = "Set2")  # optional color palette
+
+#Save plots
+
+#Save plot as png
+filename <- file.path(output_dir, paste0("Beta_Dispersion_across_Invertebrate_Families_", dataset, ".png"))
+ggsave(filename = filename, height = 5, width = 8)
+#save plot as pdf
+filename <- file.path(output_dir, paste0("Beta_Dispersion_across_Invertebrate_Families_", dataset, ".pdf"))
+ggsave(filename = filename, height = 5, width = 8)
+
+
+#Beta dispersion differed significantly among Families, suggesting that observed differences in community composition are associated with both shifts in mean composition and differences in within-group variability.
+
+
+bd_all_site<-betadisper(df_bray, metadata$Site_ID) 
+cat("Beta Dispersion Test (betadisper) by Site:\n")
+anova(bd_all_site) 
+```
+
+### NMDS Bray Curtis -ALL SAMPLES - larvae vs adult vs spider
+
+```{r plotting-NMDS- lifestages, fig.height=10, fig.width=14, message=FALSE}
+#Plotting all sites and taxa in one facet
+plotNMDS1<-plot_ordination(ps, ord_NMDS, shape="Location", color = "Lifestage") + 
+  theme_classic() +
+  geom_point(size=3)+
+  theme(strip.background = element_blank())+
+  theme(legend.key.size = unit(0.3, 'cm'), 
+        legend.title = element_text(size=20), 
+        legend.text = element_text(size=18), 
+        axis.text = element_text(size=16, color="black"),
+        axis.title = element_text(size=18, color="black"),
+        legend.position = "right")+
+  guides(color=guide_legend(title="Lifestage")) +
+  scale_color_discrete(palette(c("orange","blue","red","black","magenta","peachpuff")))
+
+
+
+print(plotNMDS1)
+
+#save plot
+filename <- file.path(output_dir, paste0("NMDS_Bray_ALLsamples_LarvaevsAdultvsSPider.png"))
+ggsave(filename = filename, height = 10, width = 14)
+#save plot as pdf
+filename <- file.path(output_dir, paste0("NMDS_Bray_ALLsamples_LarvaevsAdultvsSPider.pdf"))
+ggsave(filename = filename, height = 5, width = 8)
+
+
+#Ellipses by Lifestage
+plotNMDSls<-plot_ordination(ps, ord_NMDS, color = "Lifestage", shape="Location") + 
+  theme_classic() +
+  geom_point(size=3)+
+  theme(strip.background = element_blank())+
+  theme(legend.key.size = unit(0.3, 'cm'), 
+        legend.title = element_text(size=20), 
+        legend.text = element_text(size=18), 
+        axis.text = element_text(size=16, color="black"),
+        axis.title = element_text(size=18, color="black"),
+        legend.position = "right")+
+  guides(color=guide_legend(title="Invertebrate Taxa")) +
+  scale_color_discrete(palette(c("orange","blue","red","black","magenta","peachpuff")))+
+  stat_ellipse(type="norm", alpha=1, aes(group=Lifestage, color=Lifestage))
+
+print(plotNMDSls)
+
+
+#save plot
+filename <- file.path(output_dir, paste0("NMDS_Bray_ALLsamples_LarvaevsAdultvsSPider_Elipse.png"))
+ggsave(filename = filename, height = 10, width = 14)
+#save plot as pdf
+filename <- file.path(output_dir, paste0("NMDS_Bray_ALLsamples_LarvaevsAdultvsSPider_Elipse.pdf"))
+ggsave(filename = filename, height = 5, width = 8)
+```
+
+#### Statistics
+
+##### PERMANOVA
+
+```{r PERMANOVA-all-samples-together-lifestages}
+
+df_bray <- phyloseq::distance(ps, method = "bray")
+
+
+## PERMANOVA testing for effects of Site and Sample Type on community composition
+test.adonis.all <- adonis2(df_bray ~ Lifestage, data = metadata)
+
+cat("PERMANOVA Results for Bray-Curtis Distance:\n")
+cat("Testing effects of life stage on microbial community composition.\n\n")
+
+# Format the output 
+adonis_table <- as.data.frame(test.adonis.all)
+
+print(adonis_table)
+
+cat("\nInterpretation:\n")
+cat("- Significant p-values (< 0.05) indicate a statistically significant effect of that factor on community composition.\n")
+cat("- R² values represent the proportion of variation explained by each factor.\n")
+
+```
+
+##### Betadispersion
+
+```{r beta-dispersion-all-samples-together-lifestages}
+
+#Are microbial (or community) compositions more variable in some Families than in others?
+bd_all_ls<-betadisper(df_bray, metadata$Lifestage) 
+anova(bd_all_ls)
+
+
+#### Boxplot to show dispersion #####
+# Extract distances to centroids
+beta_df <- data.frame(
+  Lifestage = bd_all_ls$group,
+  DistanceToCentroid = bd_all_ls$distances
+)
+
+# Show first few rows to verify structure
+cat("Summary of distances to group centroids:\n")
+print(head(beta_df))
+
+
+```
+
+### NMDS Bray Curtis - IND. TAXA (Adult vs Larvae)
+
+```{r NMDS-by-taxa-adult-vs-larvae, fig.height=6, fig.width=8}
+# Define your list of Taxa
+unique_taxa <- unique(sample_data(ps)$Taxa)
+
+# Initialize result containers
+nmds_stress_values <- numeric()
+nmds_results <- list()
+permanova_results <- list()
+betadispersion_results <- list()
+
+# Define color palette
+lifestage_colors <- c("Adult" = "#1f78b4", "Larvae" = "#33a02c")
+location_colors <- c("Upstream" = "#e31a1c", "Downstream" = "#ff7f00")
+
+# Loop over each Taxa
+for (taxon in unique_taxa) {
+   # === ADD DYNAMIC HEADER ===
+  cat("\n\n#### NMDS ", taxon, "\n\n")
+  
+  cat("\nProcessing Taxa:", taxon, "\n")
+
+  # Subset data by Taxa
+  ps_sub <- subset_samples(ps, Taxa == taxon)
+  ps_sub <- prune_samples(sample_sums(ps_sub) > 0, ps_sub)
+
+  if (nsamples(ps_sub) < 3) {
+    cat("Skipping", taxon, "- not enough samples.\n")
+    next
+  }
+
+  # Check if Lifestage exists
+  metadata <- as(sample_data(ps_sub), "data.frame")
+  has_lifestage <- "Lifestage" %in% colnames(metadata) && length(unique(metadata$Lifestage)) > 1
+
+  # Distance matrix and ordination
+  dist <- phyloseq::distance(ps_sub, method = "bray")
+  set.seed(501)
+  ord <- tryCatch(ordinate(ps_sub, method = "NMDS", distance = dist, trymax = 100), error = function(e) NULL)
+
+  if (is.null(ord) || is.null(ord$points)) {
+    cat("NMDS failed for", taxon, "- skipping plot.\n")
+    next
+  }
+
+  # Save stress value
+  stress_val <- round(ord$stress, 3)
+  cat("NMDS Stress for", taxon, ":", stress_val, "\n")
+  nmds_stress_values[taxon] <- stress_val
+  nmds_results[[taxon]] <- ord
+
+  # PERMANOVA
+  permanova_site <- adonis2(dist ~ Site_ID, data = metadata)
+  permanova_location <- adonis2(dist ~ Location, data = metadata)
+  permanova_results[[taxon]] <- list(Site = permanova_site, Location = permanova_location)
+  cat("PERMANOVA Site_ID R2:", round(permanova_site$R2[1], 3), "p =", permanova_site$`Pr(>F)`[1], "\n")
+  cat("PERMANOVA Location R2:", round(permanova_location$R2[1], 3), "p =", permanova_location$`Pr(>F)`[1], "\n")
+
+  # Beta Dispersion
+  beta_site <- betadisper(dist, metadata$Site_ID)
+  beta_location <- betadisper(dist, metadata$Location)
+  beta_anova_site <- anova(beta_site)
+  beta_anova_location <- anova(beta_location)
+  betadispersion_results[[taxon]] <- list(Site = beta_anova_site, Location = beta_anova_location)
+  cat("Betadispersion Site_ID p-value:", beta_anova_site$`Pr(>F)`[1], "\n")
+  cat("Betadispersion Location p-value:", beta_anova_location$`Pr(>F)`[1], "\n")
+
+  # PERMANOVA and Beta Dispersion for Lifestage (if available)
+  if (has_lifestage) {
+    permanova_lifestage <- adonis2(dist ~ Lifestage, data = metadata)
+    beta_lifestage <- betadisper(dist, metadata$Lifestage)
+    beta_anova_lifestage <- anova(beta_lifestage)
+
+    permanova_results[[taxon]]$Lifestage <- permanova_lifestage
+    betadispersion_results[[taxon]]$Lifestage <- beta_anova_lifestage
+
+    cat("PERMANOVA Lifestage R2:", round(permanova_lifestage$R2[1], 3), "p =", permanova_lifestage$`Pr(>F)`[1], "\n")
+    cat("Betadispersion Lifestage p-value:", beta_anova_lifestage$`Pr(>F)`[1], "\n")
+  }
+
+  # Plot NMDS
+  color_var <- if (has_lifestage) "Lifestage" else "Location"
+  color_scale <- if (has_lifestage) scale_color_manual(values = lifestage_colors) else scale_color_manual(values = location_colors)
+
+  plot <- plot_ordination(ps_sub, ord, type = "samples") +
+    geom_point(aes_string(color = color_var, shape = "Location"), size = 3) +
+    color_scale +
+    theme_classic() +
+    labs(title = paste("NMDS -", taxon), color = color_var, shape = "Location")
+
+  print(plot)
+  # Save plot
+  ggsave(file.path(output_dir, paste0("NMDS_", taxon, "_", dataset, "_Bray.png")), plot = plot, width = 8, height = 6, dpi = 300)
+  ggsave(file.path(output_dir, paste0("NMDS_", taxon, "_", dataset, "_Bray.pdf")), plot = plot, width = 8, height = 6, dpi = 300)
+  cat("Saved NMDS plot for", taxon, "\n")
+}
+
+
+```
+
+#### Summary stats
+
+```{r summary-stats-by-taxa}
+summary_table <- data.frame(
+  Taxa = character(),
+  Permanova_Site_R2 = numeric(),
+  Permanova_Site_p = numeric(),
+  Permanova_Location_R2 = numeric(),
+  Permanova_Location_p = numeric(),
+  Permanova_Lifestage_R2 = numeric(),
+  Permanova_Lifestage_p = numeric(),
+  Betadispersion_Site_p = numeric(),
+  Betadispersion_Location_p = numeric(),
+  Betadispersion_Lifestage_p = numeric(),
+  NMDS_Stress = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (taxon in unique_taxa) {
+  if (!is.null(permanova_results[[taxon]]) && !is.null(betadispersion_results[[taxon]])) {
+    permanova <- permanova_results[[taxon]]
+    beta_disp <- betadispersion_results[[taxon]]
+
+    # Defaults if Lifestage not tested
+    perm_lifestage_r2 <- NA
+    perm_lifestage_p <- NA
+    beta_lifestage_p <- NA
+
+    if (!is.null(permanova$Lifestage)) {
+      perm_lifestage_r2 <- round(permanova$Lifestage$R2[1], 3)
+      perm_lifestage_p <- round(permanova$Lifestage$`Pr(>F)`[1], 4)
+    }
+
+    if (!is.null(beta_disp$Lifestage)) {
+      beta_lifestage_p <- round(beta_disp$Lifestage$`Pr(>F)`[1], 4)
+    }
+
+    summary_table <- rbind(summary_table, data.frame(
+      Taxa = taxon,
+      Permanova_Site_R2 = round(permanova$Site$R2[1], 3),
+      Permanova_Site_p = round(permanova$Site$`Pr(>F)`[1], 4),
+      Permanova_Location_R2 = round(permanova$Location$R2[1], 3),
+      Permanova_Location_p = round(permanova$Location$`Pr(>F)`[1], 4),
+      Permanova_Lifestage_R2 = perm_lifestage_r2,
+      Permanova_Lifestage_p = perm_lifestage_p,
+      Betadispersion_Site_p = round(beta_disp$Site$`Pr(>F)`[1], 4),
+      Betadispersion_Location_p = round(beta_disp$Location$`Pr(>F)`[1], 4),
+      Betadispersion_Lifestage_p = beta_lifestage_p,
+      NMDS_Stress = ifelse(!is.na(nmds_stress_values[taxon]), nmds_stress_values[taxon], NA)
+    ))
+  }
+}
+
+# Save summary table to CSV
+print(summary_table)
+write.csv(summary_table, file = file.path(output_dir, paste0("NMDS_Summary_Stats_taxa_", dataset, ".csv")), row.names = FALSE)
+cat("Summary table saved as 'NMDS_Summary_Stats_taxa_", dataset, ".csv'\n")
+
+# Save stress values as a separate CSV
+write.csv(as.data.frame(nmds_stress_values), file = file.path(output_dir, paste0("NMDS_Stress_Values_", dataset, ".csv")))
+cat("NMDS stress values saved as 'NMDS_Stress_Values_", dataset, ".csv'\n")
+```
+
+### NMDS Bray Curtis - IND. TAXA and LIFESTAGES
+
+```{r NMDS-by-taxa-and-lifstage, fig.height=6, fig.width=8}
+# Define list of Sampletypes
+unique_sample_type <- unique(sample_data(ps)$Sample_Type)
+
+# create result containers
+nmds_stress_values <- numeric()
+nmds_results <- list()
+permanova_results <- list()
+betadispersion_results <- list()
+
+# Define color palette
+location_colors <- c("UP" = "#009900", "DWN" = "#e31a1c")
+
+# Loop over each Sample_Type
+for (sample_type in unique_sample_type) {
+  #adding dynamic headers
+  cat("\n\n#### NMDS ", sample_type, "\n\n")
+  
+  cat("\nProcessing Sample_Type:", sample_type, "\n")
+
+  # Subset data by Sample_Type
+  ps_sub <- subset_samples(ps, Sample_Type == sample_type)
+  ps_sub <- prune_samples(sample_sums(ps_sub) > 0, ps_sub)
+
+  if (nsamples(ps_sub) < 3) {
+    cat("Skipping", sample_type, "- not enough samples.\n")
+    next
+  }
+
+  # Get corresponding metadata
+  metadata_sub <- data.frame(sample_data(ps_sub))
+
+  # Distance matrix and ordination
+  dist <- phyloseq::distance(ps_sub, method = "bray")
+  set.seed(501)
+  ord <- tryCatch(ordinate(ps_sub, method = "NMDS", distance = dist, trymax = 100), error = function(e) NULL)
+
+  if (is.null(ord) || is.null(ord$points)) {
+    cat("NMDS failed for", sample_type, "- skipping plot.\n")
+    next
+  }
+
+  # Save stress value
+  stress_val <- round(ord$stress, 3)
+  cat("NMDS Stress for", sample_type, ":", stress_val, "\n")
+  nmds_stress_values[sample_type] <- stress_val
+  nmds_results[[sample_type]] <- ord
+
+  # PERMANOVA
+  permanova_site <- adonis2(dist ~ Site_ID, data = metadata_sub)
+  permanova_location <- adonis2(dist ~ Location, data = metadata_sub)
+  permanova_results[[sample_type]] <- list(Site = permanova_site, Location = permanova_location)
+
+  cat("PERMANOVA Site_ID R2:", round(permanova_site$R2[1], 3), "p =", permanova_site$`Pr(>F)`[1], "\n")
+  cat("PERMANOVA Location R2:", round(permanova_location$R2[1], 3), "p =", permanova_location$`Pr(>F)`[1], "\n")
+
+  # Beta Dispersion
+  beta_site <- betadisper(dist, metadata_sub$Site_ID)
+  beta_location <- betadisper(dist, metadata_sub$Location)
+  beta_anova_site <- anova(beta_site)
+  beta_anova_location <- anova(beta_location)
+
+  betadispersion_results[[sample_type]] <- list(Site = beta_anova_site, Location = beta_anova_location)
+
+  cat("Betadispersion Site_ID p-value:", beta_anova_site$`Pr(>F)`[1], "\n")
+  cat("Betadispersion Location p-value:", beta_anova_location$`Pr(>F)`[1], "\n")
+
+  # Plot NMDS
+  plot <- plot_ordination(ps_sub, ord, type = "samples") +
+    geom_point(aes(color = Location, shape = Site), size = 3) +
+    scale_color_manual(values = location_colors) +
+    theme_classic() +
+    labs(title = paste("NMDS -", sample_type), color = "Location", shape = "Location")
+
+  
+  print(plot)
+  # Save plots
+  ggsave(file.path(output_dir, paste0("NMDS_", sample_type, "_", dataset, "_Bray.png")), plot = plot, width = 8, height = 6, dpi = 300)
+  ggsave(file.path(output_dir, paste0("NMDS_", sample_type, "_", dataset, "_Bray.pdf")), plot = plot, width = 8, height = 6, dpi = 300)
+  cat("Saved NMDS plot for", sample_type, "\n")
+}
+
+```
+
+#### Summary stats
+
+```{r summary-stats-by-sampletype}
+summary_table <- data.frame(
+  Sample_Type = character(),
+  Permanova_Site_R2 = numeric(),
+  Permanova_Site_p = numeric(),
+  Permanova_Location_R2 = numeric(),
+  Permanova_Location_p = numeric(),
+  Betadispersion_Site_p = numeric(),
+  Betadispersion_Location_p = numeric(),
+  NMDS_Stress = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (sample_type in unique_sample_type) {
+  if (!is.null(permanova_results[[sample_type]]) && !is.null(betadispersion_results[[sample_type]])) {
+    permanova <- permanova_results[[sample_type]]
+    beta_disp <- betadispersion_results[[sample_type]]
+
+    summary_table <- rbind(summary_table, data.frame(
+      Sample_Type = sample_type,
+      Permanova_Site_R2 = round(permanova$Site$R2[1], 3),
+      Permanova_Site_p = round(permanova$Site$`Pr(>F)`[1], 4),
+      Permanova_Location_R2 = round(permanova$Location$R2[1], 3),
+      Permanova_Location_p = round(permanova$Location$`Pr(>F)`[1], 4),
+      Betadispersion_Site_p = round(beta_disp$Site$`Pr(>F)`[1], 4),
+      Betadispersion_Location_p = round(beta_disp$Location$`Pr(>F)`[1], 4),
+      NMDS_Stress = ifelse(!is.na(nmds_stress_values[sample_type]), nmds_stress_values[sample_type], NA)
+    ))
+  }
+}
+
+# Save summary table to CSV
+print(summary_table)
+write.csv(summary_table, file = file.path(output_dir, paste0("NMDS_Summary_Stats_sampletype_", dataset, ".csv")), row.names = FALSE)
+cat("Summary table saved as 'NMDS_Summary_Stats_sampletype_", dataset, ".csv'\n")
+
+# Save stress values as a separate CSV
+write.csv(as.data.frame(nmds_stress_values), file = file.path(output_dir, paste0("NMDS_Stress_Values_", dataset, ".csv")))
+cat("NMDS stress values saved as 'NMDS_Stress_Values_", dataset, ".csv'\n")
+
+```
+
+```{r identify-outlier, eval = FALSE}
+#There seems to be an outlier in Heptageniidae Adults with MDS1 > 4000
+
+#Define the sample_type you're interested in
+target_sample_type <- "Adult_Heptageniidae"  # Replace with your actual sample_type name
+
+# Extract NMDS results from the list
+ord <- nmds_results[[target_sample_type]]
+
+  # Extract NMDS coordinates
+  nmds_points <- as.data.frame(ord$points)
+  nmds_points$SampleID <- rownames(nmds_points)
+
+  # Identify samples with extreme NMDS1 values
+  outliers <- nmds_points[nmds_points$MDS1 > 4000, ]
+
+#identified KK2580 (WAT_DWN3_Ad_Mayfly_MB_3) as outlier (will sort out in first script (creating phyloseq object) and rerun this analysis
+```

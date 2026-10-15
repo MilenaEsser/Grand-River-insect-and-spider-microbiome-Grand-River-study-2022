@@ -1,0 +1,869 @@
+---
+title: "13_GrandRiverMB-picrust2_betadiversity"
+author: "Milena"
+date: "2026-01-27"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(vegan)
+library(ape)
+library(ggplot2)
+
+
+
+abundance_df <- read_delim("data/newpicrust2_out_pipeline-20251218/pathways_out/path_abun_unstrat_metacyc.tsv",
+  delim = "\t", col_names = TRUE, escape_double = FALSE, trim_ws = TRUE
+)
+
+
+metadata <- read.csv("data\\KK-Brittany-sample info sheet June2023.csv")
+
+
+output_dir <- "R_output"  # main folder
+output_ord <- file.path(output_dir, "PICRUSt2_ordination")
+if (dir.exists(output_ord)) unlink(output_ord, recursive = TRUE)
+# Create a fresh folder
+dir.create(output_ord, recursive = TRUE)
+
+```
+
+```{r}
+
+# Replace dots with underscores
+names(metadata) <- gsub("\\.", "_", names(metadata))
+
+# Remove trailing underscores (1 or more)
+names(metadata) <- gsub("_+$", "", names(metadata))
+
+# Proceed with modifying data
+metadata$Lifestage <- factor(metadata$Lifestage, levels = c("Larvae", "Adult", "Spider"),ordered = FALSE)
+
+contrasts(metadata$Lifestage) <- contr.treatment(3)
+
+
+abundance_samples <- colnames(abundance_df)[-1]   # remove "function."
+
+metadata <- metadata[metadata$Study_ID %in% abundance_samples, ]
+
+rownames(metadata) <- metadata$Study_ID
+
+# Factor assignments
+metadata$Lifestage <- factor(metadata$Lifestage)
+metadata$Taxa <- factor(metadata$Taxa)
+metadata$Location <- factor(metadata$Location)
+metadata$Site <- factor(metadata$Site)
+
+
+# Set pathway as rownames and transpose
+abundance_mat <- abundance_df %>%
+  column_to_rownames(var = "description") %>%  # pathways as rownames
+  t() %>%                                  # transpose to samples x features
+  as.data.frame()
+
+# Convert all columns to numeric after transposing
+abundance_mat <- abundance_mat %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.))))
+
+# Keep only samples present in metadata
+abundance_mat <- abundance_mat[rownames(metadata), ]
+
+
+# TSS normalization 
+abundance_tss <- sweep(abundance_mat, 1, rowSums(abundance_mat), FUN = "/")
+bray_dist <- vegdist(abundance_tss, method = "bray")
+pcoa_res <- ape::pcoa(bray_dist)
+
+# Extract first two axes
+pcoa_df <- as.data.frame(pcoa_res$vectors[, 1:2])
+colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+
+# Add metadata
+pcoa_df$Sample_ID <- rownames(pcoa_df)
+pcoa_df <- left_join(pcoa_df, metadata, by = c("Sample_ID" = "Study_ID"))
+
+# % variance explained
+var_exp <- round(pcoa_res$values$Relative_eig[1:2] * 100, 1)
+
+```
+
+# Whole dataset
+
+## PCoA
+
+```{r}
+
+output_pcoa<- file.path(output_ord, "PCoA_all")
+if (dir.exists(output_pcoa)) unlink(output_pcoa, recursive = TRUE)
+dir.create(output_pcoa, recursive = TRUE)
+
+
+# -----------------------------
+# PCoA by Location
+# -----------------------------
+p_loc <- ggplot(pcoa_df, aes(PCoA1, PCoA2, color = Location)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "PCoA (Bray–Curtis) – MetaCyc pathways",
+    x = paste0("PCoA1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("PCoA2 (", round(var_exp[2], 1), "%)")
+  )
+
+# Save
+ggsave(
+  filename = "PCoA_full_by_loc_picrust2.png",
+  plot = p_loc,
+  path = output_pcoa,
+  width = 6,
+  height = 4.5,
+  dpi = 300
+)
+p_loc
+# -----------------------------
+# PCoA by Lifestage
+# -----------------------------
+p_life <- ggplot(pcoa_df, aes(PCoA1, PCoA2, color = Lifestage)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "PCoA (Bray–Curtis) – MetaCyc pathways",
+    x = paste0("PCoA1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("PCoA2 (", round(var_exp[2], 1), "%)")
+  )
+
+ggsave(
+  filename = "PCoA_full_by_lifestage_picrust2.png",
+  plot = p_life,
+  path = output_pcoa,
+  width = 6,
+  height = 4.5,
+  dpi = 300
+)
+p_life
+# -----------------------------
+# PCoA by Taxa
+# -----------------------------
+p_taxa <- ggplot(pcoa_df, aes(PCoA1, PCoA2, color = Taxa)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "PCoA (Bray–Curtis) – MetaCyc pathways",
+    x = paste0("PCoA1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("PCoA2 (", round(var_exp[2], 1), "%)")
+  )
+
+ggsave(
+  filename = "PCoA_full_by_taxa_picrust2.png",
+  plot = p_taxa,
+  path = output_pcoa,
+  width = 6,
+  height = 4.5,
+  dpi = 300
+)
+
+  p_taxa
+
+```
+
+## NMDS
+
+```{r}
+
+output_NMDS <- file.path(output_ord, "NMDS_all")
+# If it exists, delete it
+if (dir.exists(output_NMDS)) unlink(output_NMDS, recursive = TRUE)
+
+# Create a fresh folder
+dir.create(output_NMDS, recursive = TRUE)
+
+
+
+###############################
+# Run NMDS (Bray-Curtis)
+
+set.seed(123) # for reproducibility
+nmds <- metaMDS(df_bray, distance = "bray", k = 2, trymax = 100)
+
+# Extract NMDS coordinates
+nmds_df <- as.data.frame(scores(nmds))
+nmds_df <- cbind(nmds_df, metadata)  
+
+###############################
+# NMDS by Location
+###############################
+p_loc_nmds <- ggplot(nmds_df, aes(NMDS1, NMDS2, color = Location)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "NMDS (Bray–Curtis) – MetaCyc pathways",
+    x = "NMDS1",
+    y = "NMDS2"
+  )
+
+p_loc_nmds
+
+ggsave(
+    filename = paste0("NMDS_full_by_loc_picrust2.png"),
+    plot = p_loc_nmds,
+    path = output_NMDS,
+    width = 6,
+    height = 4.5,
+    dpi = 300
+  )
+###############################
+# NMDS by Lifestage
+###############################
+p_life_nmds <- ggplot(nmds_df, aes(NMDS1, NMDS2, color = Lifestage)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "NMDS (Bray–Curtis) – MetaCyc pathways by Lifestage"
+  )
+
+p_life_nmds
+
+ggsave(
+    filename = paste0("NMDS_full_by_life_picrust2.png"),
+    plot = p_life_nmds,
+    path = output_NMDS,
+    width = 6,
+    height = 4.5,
+    dpi = 300
+  )
+###############################
+# NMDS by Taxa
+###############################
+p_taxa_nmds <- ggplot(nmds_df, aes(NMDS1, NMDS2, color = Taxa)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "NMDS (Bray–Curtis) – MetaCyc pathways by Taxa"
+  )
+
+p_taxa_nmds
+
+ggsave(
+    filename = paste0("NMDS_full_by_taxa_picrust2.png"),
+    plot = p_taxa_nmds,
+    path = output_NMDS,
+    width = 6,
+    height = 4.5,
+    dpi = 300
+  )
+```
+
+## PERMANOVA
+
+PERMANOVA formula explanation:
+
+Formula used: bray_dist \~ Taxa/Lifestage + Location Strata: Site
+
+**Rationale**:
+
+*- Taxa: Broad organism group (e.g., microbes, macroinvertebrates). - Lifestage: Nested within Taxa (e.g., larvae vs adult), specified as 'Taxa/Lifestage'. This tests for differences among lifestages while accounting for variation among taxa.*
+
+*- Location: Upstream vs downstream sampling points relative to anthropogenic impacts. This factor tests whether community or functional composition differs along the gradient.*
+
+*- Strata = Site: Restricts permutations within each site to account for repeated measures or spatial variability. This ensures the permutation test respects the hierarchical structure of the data.*
+
+**Notes:**
+
+*- Using 'by = "margin"' ensures each factor's R² and p-value reflects its independent contribution to variation, regardless of order.*
+
+*- The nested structure (lifestage within taxa) is maintained in the model.*
+
+**Outcome:**
+
+*- R²: proportion of variance explained by each factor.*
+
+*- p-values: significance from permutation tests, indicating whether observed differences are unlikely by chance.*
+
+```{r}
+adonis<-adonis2(
+  bray_dist ~ Taxa/Lifestage + Location,
+  data = metadata,
+  permutations = 999,
+  by = "margin",
+  strata = metadata$Site
+)
+
+print(adonis)
+```
+
+# Create for each taxon
+
+```{r}
+# Create a PCoA output folder (inside your ordination folder)
+output_pcoa_by_taxa <- file.path(output_ord, "PCoA_by_Taxa")
+if (dir.exists(output_pcoa_by_taxa)) unlink(output_pcoa_by_taxa, recursive = TRUE)
+dir.create(output_pcoa_by_taxa, recursive = TRUE)
+
+# Safety: ensure factors exist and are consistent
+metadata <- metadata %>%
+  mutate(
+    Taxa      = factor(Taxa),
+    Location  = factor(Location),
+    Lifestage = factor(Lifestage),
+    Site      = factor(Site)
+  )
+
+# Function: run PCoA for one taxon and save plot(s)
+run_pcoa_for_taxon <- function(taxon_name,
+                              metadata,
+                              abundance_mat,
+                              out_base,
+                              min_samples = 6,
+                              min_groups_per_location = 2) {
+
+  # subset metadata
+  meta_sub <- metadata %>% filter(Taxa == taxon_name)
+
+  # require enough samples
+  if (nrow(meta_sub) < min_samples) {
+    message("Skipping ", taxon_name, " (n=", nrow(meta_sub), " < ", min_samples, ")")
+    return(invisible(NULL))
+  }
+
+  # subset abundance matrix (keep only those samples)
+  abundance_sub <- abundance_mat[rownames(meta_sub), , drop = FALSE]
+
+  # drop all-zero pathways (helps with distances)
+  keep_cols <- colSums(abundance_sub, na.rm = TRUE) > 0
+  abundance_sub <- abundance_sub[, keep_cols, drop = FALSE]
+
+  # remove samples with zero total counts (avoid division by zero)
+  rs <- rowSums(abundance_sub, na.rm = TRUE)
+  keep_rows <- rs > 0
+  meta_sub <- meta_sub[keep_rows, , drop = FALSE]
+  abundance_sub <- abundance_sub[keep_rows, , drop = FALSE]
+
+  if (nrow(meta_sub) < min_samples) {
+    message("Skipping ", taxon_name, " after filtering zeros (n=", nrow(meta_sub), ")")
+    return(invisible(NULL))
+  }
+
+  # Create taxon folder
+  taxon_safe <- gsub("[^A-Za-z0-9_\\-]", "_", as.character(taxon_name))
+  out_dir <- file.path(out_base, taxon_safe)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # TSS normalize
+  abundance_tss <- sweep(abundance_sub, 1, rowSums(abundance_sub), FUN = "/")
+
+  # Bray-Curtis + PCoA
+  bray_dist <- vegdist(abundance_tss, method = "bray")
+  pcoa_res <- ape::pcoa(bray_dist)
+
+  # Extract axes
+  pcoa_df <- as.data.frame(pcoa_res$vectors[, 1:2])
+  colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+  pcoa_df$Sample_ID <- rownames(pcoa_df)
+
+  # join metadata
+  meta_sub$Sample_ID <- rownames(meta_sub)
+  pcoa_df <- left_join(pcoa_df, meta_sub, by = "Sample_ID")
+
+  # variance explained
+  var_exp <- round(pcoa_res$values$Relative_eig[1:2] * 100, 1)
+
+  # Decide whether to draw ellipses (need enough points per Location)
+  loc_counts <- table(pcoa_df$Location)
+  draw_ellipses <- all(loc_counts >= min_groups_per_location)
+
+  # Build plot
+  p <- ggplot(pcoa_df, aes(PCoA1, PCoA2, color = Location, shape = Lifestage)) +
+    geom_point(size = 3, alpha = 0.85) +
+    theme_classic(base_size = 13) +
+    labs(
+      title = paste0("PCoA (Bray–Curtis) – MetaCyc (PICRUSt2), ", taxon_name),
+      x = paste0("PCoA1 (", var_exp[1], "%)"),
+      y = paste0("PCoA2 (", var_exp[2], "%)")
+    )
+
+  if (draw_ellipses) {
+    p <- p + stat_ellipse(aes(group = Location), type = "t", level = 0.95)
+  }
+
+  # Save plot
+  ggsave(
+    filename = paste0("PCoA_", taxon_safe, "_loc_color_lifestage_shape.png"),
+    plot = p,
+    path = out_dir,
+    width = 6.5,
+    height = 5,
+    dpi = 300
+  )
+
+  #small PERMANOVA summary for Location within this taxon
+  # NOTE: adonis2 wants a dist object and a data.frame with matching rows
+  perm <- tryCatch({
+    adonis2(bray_dist ~ Location, data = meta_sub, strata = meta_sub$Site, permutations = 999)
+  }, error = function(e) NULL)
+
+  if (!is.null(perm)) {
+    write.csv(
+      as.data.frame(perm),
+      file = file.path(out_dir, paste0("PERMANOVA_Location_", taxon_safe, ".csv")),
+      row.names = TRUE
+    )
+  }
+
+  return(invisible(list(plot = p, pcoa = pcoa_res, pcoa_df = pcoa_df, perm = perm)))
+}
+
+# -----------------------------
+# Run loop over taxa
+# -----------------------------
+taxa_list <- sort(unique(as.character(metadata$Taxa)))
+results_list <- vector("list", length(taxa_list))
+names(results_list) <- taxa_list
+
+for (tx in taxa_list) {
+  results_list[[tx]] <- run_pcoa_for_taxon(
+    taxon_name  = tx,
+    metadata    = metadata,
+    abundance_mat = abundance_mat,
+    out_base    = output_pcoa_by_taxa,
+    min_samples = 6
+  )
+}
+
+message("Done. Saved to: ", output_pcoa_by_taxa)
+```
+
+### Looking at Hydropsychidae outliers
+
+```{r}
+
+# Single-taxon PCoA (Bray–Curtis) with and without outliers + Outlier metadata table export
+
+
+# -----------------------------
+# USER SETTINGS
+# -----------------------------
+taxon_name <- "Hydropsychidae" 
+min_samples <- 6                 # minimum samples to run ordination
+outlier_quantile <- 0.95         # for centroid-distance outliers (e.g., 0.95 or 0.97)
+
+
+output_base <- file.path("R_output", "PICRUSt2_ordination", "PCoA_single_taxon_outliers")
+if (dir.exists(output_base)) unlink(output_base, recursive = TRUE)
+dir.create(output_base, recursive = TRUE)
+
+
+# Subset to the single taxon
+
+meta_sub <- metadata %>%
+  mutate(
+    Taxa      = as.character(Taxa),
+    Study_ID  = as.character(Study_ID),
+    Location  = factor(Location),
+    Lifestage = factor(Lifestage),
+    Site      = factor(Site)
+  ) %>%
+  filter(Taxa == taxon_name) %>%
+  filter(Study_ID %in% rownames(abundance_mat))
+
+if (nrow(meta_sub) < min_samples) {
+  stop("Not enough samples for taxon: ", taxon_name, " (n=", nrow(meta_sub), ")")
+}
+
+meta_sub <- as.data.frame(meta_sub)
+rownames(meta_sub) <- meta_sub$Study_ID
+
+abund_sub <- abundance_mat[rownames(meta_sub), , drop = FALSE]
+
+# Drop pathways that are all-zero within this taxon
+keep_cols <- colSums(abund_sub, na.rm = TRUE) > 0
+abund_sub <- abund_sub[, keep_cols, drop = FALSE]
+
+# Drop samples with zero total (avoid divide-by-zero)
+rs <- rowSums(abund_sub, na.rm = TRUE)
+keep_rows <- rs > 0
+abund_sub <- abund_sub[keep_rows, , drop = FALSE]
+meta_sub  <- meta_sub[keep_rows, , drop = FALSE]
+
+if (nrow(meta_sub) < min_samples) {
+  stop("Not enough nonzero samples for taxon after filtering: ", taxon_name,
+       " (n=", nrow(meta_sub), ")")
+}
+
+
+# Compute PCoA (WITH all samples)
+abund_tss <- sweep(abund_sub, 1, rowSums(abund_sub), FUN = "/")
+bray_dist <- vegdist(abund_tss, method = "bray")
+pcoa_res  <- ape::pcoa(bray_dist)
+
+pcoa_df <- as.data.frame(pcoa_res$vectors[, 1:2])
+colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+pcoa_df$Sample_ID <- rownames(pcoa_df)
+
+meta_sub$Sample_ID <- rownames(meta_sub)
+pcoa_df <- left_join(pcoa_df, meta_sub, by = "Sample_ID")
+
+var_exp <- round(pcoa_res$values$Relative_eig[1:2] * 100, 1)
+
+
+#  Identify outliers in PCoA space (distance from centroid)
+centroid <- colMeans(pcoa_df[, c("PCoA1", "PCoA2")], na.rm = TRUE)
+
+pcoa_df$Distance_to_centroid <- sqrt(
+  (pcoa_df$PCoA1 - centroid["PCoA1"])^2 +
+  (pcoa_df$PCoA2 - centroid["PCoA2"])^2
+)
+
+threshold <- as.numeric(quantile(pcoa_df$Distance_to_centroid, outlier_quantile, na.rm = TRUE))
+pcoa_df$outlier <- pcoa_df$Distance_to_centroid > threshold
+
+# Outlier list (coords + key metadata)
+outliers <- pcoa_df %>%
+  filter(outlier) %>%
+  arrange(desc(Distance_to_centroid)) %>%
+  select(
+    Sample_ID, Distance_to_centroid, PCoA1, PCoA2,
+    Location, Lifestage, Site, everything()
+  )
+
+# Save outlier table
+write.csv(outliers,
+          file = file.path(output_base, paste0("OUTLIERS_", taxon_name, "_centroidDist.csv")),
+          row.names = FALSE)
+
+# Also save a minimal outlier summary (only most relevant fields)
+outliers_min <- outliers %>%
+  select(Sample_ID, Distance_to_centroid, Location, Lifestage, Site)
+
+write.csv(outliers_min,
+          file = file.path(output_base, paste0("OUTLIERS_", taxon_name, "_MIN.csv")),
+          row.names = FALSE)
+
+
+# Plot WITH outliers (Location color, Lifestage shape)
+p_with <- ggplot(pcoa_df, aes(PCoA1, PCoA2, color = Location, shape = Lifestage)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = Location), type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = paste0("PCoA (Bray–Curtis) – MetaCyc (PICRUSt2), ", taxon_name, " (with outliers)"),
+    x = paste0("PCoA1 (", var_exp[1], "%)"),
+    y = paste0("PCoA2 (", var_exp[2], "%)")
+  )
+
+ggsave(
+  filename = paste0("PCoA_", taxon_name, "_WITH_outliers.png"),
+  plot = p_with,
+  path = output_base,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+
+#  Remove outliers and recompute PCoA (NO outliers)
+outlier_ids <- outliers$Sample_ID
+
+meta_no_out <- meta_sub[!rownames(meta_sub) %in% outlier_ids, , drop = FALSE]
+abund_no_out <- abund_sub[rownames(meta_no_out), , drop = FALSE]
+
+if (nrow(meta_no_out) < min_samples) {
+  stop("Too few samples after removing outliers (n=", nrow(meta_no_out), ").")
+}
+
+# TSS normalize + Bray–Curtis
+abund_no_out_tss <- sweep(abund_no_out, 1, rowSums(abund_no_out), FUN = "/")
+bray_no_out <- vegdist(abund_no_out_tss, method = "bray")
+pcoa_no_out <- ape::pcoa(bray_no_out)
+
+pcoa_no_out_df <- as.data.frame(pcoa_no_out$vectors[, 1:2])
+colnames(pcoa_no_out_df) <- c("PCoA1", "PCoA2")
+pcoa_no_out_df$Sample_ID <- rownames(pcoa_no_out_df)
+
+meta_no_out$Sample_ID <- rownames(meta_no_out)
+pcoa_no_out_df <- left_join(pcoa_no_out_df, meta_no_out, by = "Sample_ID")
+
+var_exp_no_out <- round(pcoa_no_out$values$Relative_eig[1:2] * 100, 1)
+
+
+# Plot WITHOUT outlier
+p_no_out <- ggplot(pcoa_no_out_df, aes(PCoA1, PCoA2, color = Location, shape = Lifestage)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = Location), type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = paste0("PCoA (Bray–Curtis) – MetaCyc (PICRUSt2), ", taxon_name, " (outliers removed)"),
+    x = paste0("PCoA1 (", var_exp_no_out[1], "%)"),
+    y = paste0("PCoA2 (", var_exp_no_out[2], "%)")
+  )
+
+ggsave(
+  filename = paste0("PCoA_", taxon_name, "_NO_outliers.png"),
+  plot = p_no_out,
+  path = output_base,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+
+# PERMANOVA Location with vs without outliers (strata = Site)
+perm_with <- tryCatch(
+  adonis2(bray_dist ~ Location, data = meta_sub, strata = meta_sub$Site, permutations = 999),
+  error = function(e) NULL
+)
+
+perm_no_out <- tryCatch(
+  adonis2(bray_no_out ~ Location, data = meta_no_out, strata = meta_no_out$Site, permutations = 999),
+  error = function(e) NULL
+)
+
+if (!is.null(perm_with)) {
+  write.csv(as.data.frame(perm_with),
+            file = file.path(output_base, paste0("PERMANOVA_Location_WITH_outliers_", taxon_name, ".csv")),
+            row.names = TRUE)
+}
+
+if (!is.null(perm_no_out)) {
+  write.csv(as.data.frame(perm_no_out),
+            file = file.path(output_base, paste0("PERMANOVA_Location_NO_outliers_", taxon_name, ".csv")),
+            row.names = TRUE)
+}
+
+
+message("Saved outputs to: ", output_base)
+message("Outlier threshold (", outlier_quantile * 100, "th percentile) = ", round(threshold, 4))
+message("N outliers = ", nrow(outliers))
+
+# Print in console
+print(outliers_min)
+
+# Show plots 
+p_with
+p_no_out
+
+```
+
+### Chironomidae with/without outliers
+
+```{r}
+# Single-taxon PCoA (Bray–Curtis) with and without outliers + Outlier metadata table export
+
+
+library(tidyverse)
+library(vegan)
+library(ape)
+library(ggplot2)
+
+
+taxon_name <- "Chironomidae"   
+min_samples <- 6                 # minimum samples to run ordination
+outlier_quantile <- 0.95         # for centroid-distance outliers (e.g., 0.95 or 0.97)
+
+
+output_base <- file.path("R_output", "PICRUSt2_ordination", "PCoA_single_taxon_outliers")
+if (dir.exists(output_base)) unlink(output_base, recursive = TRUE)
+dir.create(output_base, recursive = TRUE)
+
+
+#Subset to the single taxon
+meta_sub <- metadata %>%
+  mutate(
+    Taxa      = as.character(Taxa),
+    Study_ID  = as.character(Study_ID),
+    Location  = factor(Location),
+    Lifestage = factor(Lifestage),
+    Site      = factor(Site)
+  ) %>%
+  filter(Taxa == taxon_name) %>%
+  filter(Study_ID %in% rownames(abundance_mat))
+
+if (nrow(meta_sub) < min_samples) {
+  stop("Not enough samples for taxon: ", taxon_name, " (n=", nrow(meta_sub), ")")
+}
+
+meta_sub <- as.data.frame(meta_sub)
+rownames(meta_sub) <- meta_sub$Study_ID
+
+abund_sub <- abundance_mat[rownames(meta_sub), , drop = FALSE]
+
+# Drop pathways that are all-zero within this taxon
+keep_cols <- colSums(abund_sub, na.rm = TRUE) > 0
+abund_sub <- abund_sub[, keep_cols, drop = FALSE]
+
+# Drop samples with zero total (avoid divide-by-zero)
+rs <- rowSums(abund_sub, na.rm = TRUE)
+keep_rows <- rs > 0
+abund_sub <- abund_sub[keep_rows, , drop = FALSE]
+meta_sub  <- meta_sub[keep_rows, , drop = FALSE]
+
+if (nrow(meta_sub) < min_samples) {
+  stop("Not enough nonzero samples for taxon after filtering: ", taxon_name,
+       " (n=", nrow(meta_sub), ")")
+}
+
+
+# Compute PCoA (WITH all samples)
+abund_tss <- sweep(abund_sub, 1, rowSums(abund_sub), FUN = "/")
+bray_dist <- vegdist(abund_tss, method = "bray")
+pcoa_res  <- ape::pcoa(bray_dist)
+
+pcoa_df <- as.data.frame(pcoa_res$vectors[, 1:2])
+colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+pcoa_df$Sample_ID <- rownames(pcoa_df)
+
+meta_sub$Sample_ID <- rownames(meta_sub)
+pcoa_df <- left_join(pcoa_df, meta_sub, by = "Sample_ID")
+
+var_exp <- round(pcoa_res$values$Relative_eig[1:2] * 100, 1)
+
+
+# Identify outliers in PCoA space (distance from centroid)
+centroid <- colMeans(pcoa_df[, c("PCoA1", "PCoA2")], na.rm = TRUE)
+
+pcoa_df$Distance_to_centroid <- sqrt(
+  (pcoa_df$PCoA1 - centroid["PCoA1"])^2 +
+  (pcoa_df$PCoA2 - centroid["PCoA2"])^2
+)
+
+threshold <- as.numeric(quantile(pcoa_df$Distance_to_centroid, outlier_quantile, na.rm = TRUE))
+pcoa_df$outlier <- pcoa_df$Distance_to_centroid > threshold
+
+# Outlier list (coords + key metadata)
+outliers <- pcoa_df %>%
+  filter(outlier) %>%
+  arrange(desc(Distance_to_centroid)) %>%
+  select(
+    Sample_ID, Distance_to_centroid, PCoA1, PCoA2,
+    Location, Lifestage, Site, everything()
+  )
+
+# Save outlier table
+write.csv(outliers,
+          file = file.path(output_base, paste0("OUTLIERS_", taxon_name, "_centroidDist.csv")),
+          row.names = FALSE)
+
+# Also save a minimal outlier summary (only most relevant fields)
+outliers_min <- outliers %>%
+  select(Sample_ID, Distance_to_centroid, Location, Lifestage, Site)
+
+write.csv(outliers_min,
+          file = file.path(output_base, paste0("OUTLIERS_", taxon_name, "_MIN.csv")),
+          row.names = FALSE)
+
+#lot WITH outliers (Location color, Lifestage shape)
+p_with <- ggplot(pcoa_df, aes(PCoA1, PCoA2, color = Location, shape = Lifestage)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = Location), type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = paste0("PCoA (Bray–Curtis) – MetaCyc (PICRUSt2), ", taxon_name, " (with outliers)"),
+    x = paste0("PCoA1 (", var_exp[1], "%)"),
+    y = paste0("PCoA2 (", var_exp[2], "%)")
+  )
+
+ggsave(
+  filename = paste0("PCoA_", taxon_name, "_WITH_outliers.png"),
+  plot = p_with,
+  path = output_base,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+
+# Remove outliers and recompute PCoA (NO outliers)
+outlier_ids <- outliers$Sample_ID
+
+meta_no_out <- meta_sub[!rownames(meta_sub) %in% outlier_ids, , drop = FALSE]
+abund_no_out <- abund_sub[rownames(meta_no_out), , drop = FALSE]
+
+if (nrow(meta_no_out) < min_samples) {
+  stop("Too few samples after removing outliers (n=", nrow(meta_no_out), ").")
+}
+
+# TSS normalize + Bray–Curtis
+abund_no_out_tss <- sweep(abund_no_out, 1, rowSums(abund_no_out), FUN = "/")
+bray_no_out <- vegdist(abund_no_out_tss, method = "bray")
+pcoa_no_out <- ape::pcoa(bray_no_out)
+
+pcoa_no_out_df <- as.data.frame(pcoa_no_out$vectors[, 1:2])
+colnames(pcoa_no_out_df) <- c("PCoA1", "PCoA2")
+pcoa_no_out_df$Sample_ID <- rownames(pcoa_no_out_df)
+
+meta_no_out$Sample_ID <- rownames(meta_no_out)
+pcoa_no_out_df <- left_join(pcoa_no_out_df, meta_no_out, by = "Sample_ID")
+
+var_exp_no_out <- round(pcoa_no_out$values$Relative_eig[1:2] * 100, 1)
+
+
+# Plot WITHOUT outliers
+p_no_out <- ggplot(pcoa_no_out_df, aes(PCoA1, PCoA2, color = Location, shape = Lifestage)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(group = Location), type = "t", level = 0.95) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = paste0("PCoA (Bray–Curtis) – MetaCyc (PICRUSt2), ", taxon_name, " (outliers removed)"),
+    x = paste0("PCoA1 (", var_exp_no_out[1], "%)"),
+    y = paste0("PCoA2 (", var_exp_no_out[2], "%)")
+  )
+
+ggsave(
+  filename = paste0("PCoA_", taxon_name, "_NO_outliers.png"),
+  plot = p_no_out,
+  path = output_base,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+# PERMANOVA Location with vs without outliers (strata = Site)
+perm_with <- tryCatch(
+  adonis2(bray_dist ~ Location, data = meta_sub, strata = meta_sub$Site, permutations = 999),
+  error = function(e) NULL
+)
+
+perm_no_out <- tryCatch(
+  adonis2(bray_no_out ~ Location, data = meta_no_out, strata = meta_no_out$Site, permutations = 999),
+  error = function(e) NULL
+)
+
+if (!is.null(perm_with)) {
+  write.csv(as.data.frame(perm_with),
+            file = file.path(output_base, paste0("PERMANOVA_Location_WITH_outliers_", taxon_name, ".csv")),
+            row.names = TRUE)
+}
+
+if (!is.null(perm_no_out)) {
+  write.csv(as.data.frame(perm_no_out),
+            file = file.path(output_base, paste0("PERMANOVA_Location_NO_outliers_", taxon_name, ".csv")),
+            row.names = TRUE)
+}
+
+
+message("Saved outputs to: ", output_base)
+message("Outlier threshold (", outlier_quantile * 100, "th percentile) = ", round(threshold, 4))
+message("N outliers = ", nrow(outliers))
+
+# Print in console
+print(outliers_min)
+
+
+p_with
+p_no_out
+
+```

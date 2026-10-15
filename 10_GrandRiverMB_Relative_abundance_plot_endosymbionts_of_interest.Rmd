@@ -1,0 +1,704 @@
+---
+title: "Relative Abundance Plot for Endosymbionts"
+author: "Milena Esser"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+## Setup
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls()) # Clean environment
+library(phyloseq)
+library(tidyverse)
+library(scales)
+library(rlang)
+
+
+# Set base theme
+theme_set(theme_bw(base_size = 14))
+
+# Create output_dir once
+output_dir <- file.path("R_output", "Endosymbiont_Stack_Plots")
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+```
+
+## Load data
+
+```{r load-data}
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_unnorm.RData")
+
+
+#filter for endosymbiont genera of interest
+# List of endosymbiont genera of interest
+endo_genera <- c(
+  "Buchnera", "Candidatus Cardinium", "Rickettsia", "Wolbachia",
+  "Spiroplasma", "Diplorickettsia", "Candidatus Hamiltonella",
+  "Candidatus Megaira", "Candidatus Regiella", "Rickettsiella"
+)
+
+endo_genera <- c(
+  # Core well-known insect endosymbionts
+  "Wolbachia", "Rickettsia", "Rickettsiella", "Diplorickettsia",
+  "Spiroplasma", "Arsenophonus", "Serratia", 
+  "Candidatus_Hamiltonella", "Candidatus_Regiella",
+  "Candidatus_Cardinium", "Candidatus_Megaira",
+
+  # Obligate or host-restricted symbionts (may appear if filtering less strict)
+  "Buchnera", "Sulcia", "Hodgkinia", "Nasuia",
+
+  # Additional reproductive manipulators / heritable pathogens
+  "Candidatus_Midichloria", "Candidatus_Lariskella",
+  
+  # Potential persistent facultative / context-dependent symbionts
+  "Microsporidia", "Nosema", "Vavraia", "Encephalitozoon"
+)
+
+```
+
+# Stacked Barplot Endosymbionts
+
+## Flexible plotting function
+
+```{r plotting-function}
+plot_endosymbiont_stack <- function(
+  ps_object,
+  taxrank = "Genus",
+  grouping_vars = "Location",
+  facet_by = NULL,
+  output_dir,
+  y_limit = NULL,          # New argument for y-axis max limit, e.g. 0.3 for 30%
+  width = 10,
+  height = 6
+) {
+  
+  # Agglomerate to taxrank
+  ps_tax <- tax_glom(ps_object, taxrank = taxrank, NArm = FALSE)
+  
+  # OTU table
+  otu <- as.data.frame(otu_table(ps_tax))
+  if (taxa_are_rows(ps_tax)) otu <- t(otu)
+  
+  # Taxonomy
+  tax_df <- as.data.frame(tax_table(ps_tax))
+  tax_labels <- tax_df[[taxrank]]
+  tax_labels[is.na(tax_labels)] <- "Unknown"
+  tax_labels <- gsub(" ", "_", tax_labels)
+  colnames(otu) <- tax_labels
+  
+  # Relative abundance per sample
+  otu_rel <- otu / rowSums(otu)
+  otu_rel[is.na(otu_rel)] <- 0
+  
+  # Filter to endosymbionts only
+otu_rel_endo <- otu_rel[, colnames(otu_rel) %in% endo_genera, drop = FALSE]
+
+# Find highest abundance value
+max_abundance <- max(otu_rel_endo)
+
+# Print in % for your plot height
+max_percent <- max_abundance * 100
+
+cat("Max endosymbiont abundance across dataset:", round(max_percent, 2), "%\n")
+  
+
+y_limit <- ceiling(max_abundance * 1.1 * 10) / 10  # round up to next 0.1
+
+
+  # Metadata
+  meta <- as(sample_data(ps_tax), "data.frame")
+  
+  # Enforce factor levels if present
+  if ("Location" %in% colnames(meta)) {
+    meta$Location <- factor(meta$Location, levels = c("UP", "DWN"))
+  }
+  if ("Taxa" %in% colnames(meta)) {
+    meta$Taxa <- factor(meta$Taxa, levels = c("Chironomidae", "Heptageniidae", "Hydropsychidae", "Araneid", "Tetragnatha"))
+  }
+  if ("Lifestage" %in% colnames(meta)) {
+    meta$Lifestage <- factor(meta$Lifestage, levels = c("Larvae", "Adult", "Spider"))
+  }
+  
+  # Align samples between otu_rel and meta
+  shared_ids <- intersect(rownames(otu_rel), rownames(meta))
+  otu_rel <- otu_rel[shared_ids, , drop = FALSE]
+  meta <- meta[shared_ids, , drop = FALSE]
+  
+  # Long format of all taxa
+  plot_df <- otu_rel %>%
+    as_tibble(rownames = "SampleID") %>%
+    pivot_longer(-SampleID, names_to = "Taxon", values_to = "Abundance") %>%
+    left_join(meta %>% rownames_to_column("SampleID"), by = "SampleID")
+  
+  # Keep only the endosymbiont taxa
+  plot_df <- plot_df %>%
+    filter(Taxon %in% endo_genera)
+  
+# sum  upendosymbiont abundances per sample
+plot_df_agg <- plot_df %>%
+  group_by(SampleID, !!!syms(grouping_vars)) %>%
+  summarise(
+    total_endo_abundance = sum(Abundance),
+    .groups = "drop"
+  )
+
+# relative contributions within endosymbionts
+plot_df_taxa <- plot_df %>%
+  group_by(SampleID, !!!syms(grouping_vars), Taxon) %>%
+  summarise(
+    taxon_abundance = sum(Abundance),
+    .groups = "drop"
+  ) %>%
+  left_join(plot_df_agg, by = c("SampleID", grouping_vars)) %>%
+  mutate(
+    taxon_prop_within_endo = ifelse(total_endo_abundance > 0,
+                                     taxon_abundance / total_endo_abundance,
+                                     0)
+  )
+
+# compute mean *total_endo_abundance* per group and mean *taxon_prop_within_endo* per group
+summary_df <- plot_df_taxa %>%
+  group_by(!!!syms(c(grouping_vars, "Taxon"))) %>%
+  summarise(
+    mean_total_endo_abundance = mean(total_endo_abundance),
+    mean_taxon_prop_within_endo = mean(taxon_prop_within_endo),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_abundance = mean_total_endo_abundance * mean_taxon_prop_within_endo
+  )
+  
+  # gplot
+  p <- ggplot(
+    summary_df,
+    aes(
+      x = .data[[grouping_vars[1]]],
+      y = mean_abundance,
+      fill = Taxon
+    )
+  ) +
+    geom_bar(stat = "identity", position = "stack", color = "black", alpha = 0.9) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      expand = expansion(mult = c(0, 0.02)),
+      limits = c(0, y_limit)   # set y limit if provided
+    ) +
+    labs(
+      title = paste0("Stacked Relative Abundance of Endosymbionts (", taxrank, ")"),
+      y = "Mean Relative Abundance (%)",
+      x = grouping_vars[1],
+      fill = taxrank
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "right"
+    )
+  
+  # facet with multiple variables as subfacets
+  if (!is.null(facet_by)) {
+    facet_formula <- as.formula(paste("~", paste(facet_by, collapse = "+")))
+    p <- p + facet_wrap(facet_formula, scales = "free")
+  }
+  
+  # create output file names
+  filename_base <- paste0(
+    "Stacked_RA_Endosymbionts_", taxrank, "_",
+    paste(grouping_vars, collapse = "_"),
+    if (!is.null(facet_by)) paste0("_facet_", paste(facet_by, collapse = "_")) else ""
+  )
+  
+  # saving plots
+  ggsave(
+    filename = file.path(output_dir, paste0(filename_base, ".png")),
+    plot = p,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+  
+  ggsave(
+    filename = file.path(output_dir, paste0(filename_base, ".pdf")),
+    plot = p,
+    width = width,
+    height = height
+  )
+  
+  message("Saved stacked plot as PNG and PDF: ", filename_base)
+  
+  return(p)
+}
+```
+
+## Plot
+
+Select the following:
+
+taxrank: e.g. "Species", "Genus" etc
+
+grouping_vars: select grouping variables based on which mean relative abundances are calculated e.g., Location, Lifestage, Taxa or multiple in vector
+
+facet_by (needs to be included in grouping_vars)
+
+```{r}
+#see arguments of function
+args(plot_endosymbiont_stack)
+
+
+# Example:
+ p <- plot_endosymbiont_stack(
+  ps_object = ps_final,
+  taxrank = "Genus",
+  grouping_vars = c("Location", "Lifestage", "Taxa"),
+  facet_by = c("Taxa", "Lifestage"),
+  output_dir = output_dir,
+  y_limit =0.6,    # dynamically set
+  width = 12,
+  height = 8
+)
+p
+```
+
+# Ind. bars + SE barlot of Endosymbionts
+
+## Flexible plotting functions
+
+Total
+
+```{r}
+plot_endosymbiont_barplot2 <- function(
+    ps_object,
+    taxrank = "Genus",
+    grouping_vars = c("Location"),
+    facet_by = NULL,
+    output_dir = NULL,
+    width = 10,
+    height = 6,
+    save_plot = FALSE
+) {
+    require(tidyverse)
+    require(phyloseq)
+    require(scales)
+    
+    # aggregate
+    ps_tax <- tax_glom(ps_object, taxrank = taxrank, NArm = FALSE)
+    
+    # OTU table
+    otu <- as.data.frame(otu_table(ps_tax))
+    if (taxa_are_rows(ps_tax)) otu <- t(otu)
+    
+    # tax labels
+    tax_df <- as.data.frame(tax_table(ps_tax))
+    tax_labels <- tax_df[[taxrank]]
+    tax_labels[is.na(tax_labels)] <- "Unknown"
+    tax_labels <- gsub(" ", "_", tax_labels)
+    colnames(otu) <- tax_labels
+    
+    # rel abundance
+    otu_rel <- otu / rowSums(otu)
+    otu_rel[is.na(otu_rel)] <- 0
+    
+    # metadata
+    meta <- as(sample_data(ps_tax), "data.frame")
+    if ("Location" %in% colnames(meta)) {
+        meta$Location <- factor(meta$Location, levels = c("UP", "DWN"))
+    }
+    if ("Taxa" %in% colnames(meta)) {
+        meta$Taxa <- factor(meta$Taxa, levels = c("Chironomidae", "Heptageniidae", "Hydropsychidae", "Araneid", "Tetragnatha"))
+    }
+    if ("Lifestage" %in% colnames(meta)) {
+        meta$Lifestage <- factor(meta$Lifestage, levels = c("Larvae", "Adult", "Spider"))
+    }
+    
+    # align
+    shared_ids <- intersect(rownames(otu_rel), rownames(meta))
+    otu_rel <- otu_rel[shared_ids, , drop = FALSE]
+    meta <- meta[shared_ids, , drop = FALSE]
+    
+    # long format
+    plot_df <- otu_rel %>%
+        as_tibble(rownames = "SampleID") %>%
+        pivot_longer(-SampleID, names_to = "Taxon", values_to = "Abundance") %>%
+        left_join(meta %>% rownames_to_column("SampleID"), by = "SampleID")
+    
+    # filter to endosymbionts
+    plot_df <- plot_df %>%
+        filter(Taxon %in% endo_genera)
+    
+    if (nrow(plot_df) == 0) {
+        message("No endosymbiont taxa present at ", taxrank, " level in the dataset.")
+        return(NULL)
+    }
+    
+    # sum abundance across endosymbionts for total endo abundance per sample
+    plot_df_sum <- plot_df %>%
+        group_by(SampleID, !!!syms(grouping_vars)) %>%
+        summarise(Abundance = sum(Abundance), .groups = "drop")
+    
+    # calc mean and SE per group
+    summary_df <- plot_df_sum %>%
+        group_by(!!!syms(grouping_vars)) %>%
+        summarise(
+            mean_abundance = mean(Abundance),
+            se_abundance = sd(Abundance) / sqrt(n()),
+            .groups = "drop"
+        )
+    
+    # determine dynamic y-axis limit with 20% headroom
+    max_mean <- max(summary_df$mean_abundance)
+    y_limit <- min(1, max_mean * 1.2)
+    
+    #plotting
+    p <- ggplot(summary_df, aes_string(
+        x = grouping_vars[1],
+        y = "mean_abundance",
+        fill = grouping_vars[1]
+    )) +
+        geom_bar(stat = "identity", position = position_dodge(width = 0.8),
+                 color = "black", alpha = 0.85) +
+        geom_errorbar(
+            aes(
+                ymin = pmax(0, mean_abundance - se_abundance),
+                ymax = mean_abundance + se_abundance
+            ),
+            position = position_dodge(width = 0.8),
+            width = 0.2
+        ) +
+        scale_y_continuous(
+            labels = percent_format(accuracy = 0.1),
+            expand = expansion(mult = c(0, 0.02)),
+            limits = c(0, y_limit)
+        ) +
+        labs(
+            title = paste0("Total Endosymbiont Relative Abundance (", taxrank, ")"),
+            y = "Relative Abundance (%)",
+            x = grouping_vars[1],
+            fill = grouping_vars[1]
+        ) +
+        theme_bw(base_size = 14) +
+        theme(
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "right"
+        )
+    
+    if (!is.null(facet_by)) {
+        facet_formula <- as.formula(paste("~", paste(facet_by, collapse = "+")))
+        p <- p + facet_wrap(facet_formula, scales = "free_y", nrow = 4)
+    }
+    
+  
+    if (save_plot && !is.null(output_dir)) {
+        filename_base <- paste0(
+            "TOTAL_Barplot_RA_Endosymbionts_", taxrank, "_",
+            paste(grouping_vars, collapse = "_"),
+            if (!is.null(facet_by)) paste0("_facet_", paste(facet_by, collapse = "_")) else ""
+        )
+        
+        ggsave(
+            filename = file.path(output_dir, paste0(filename_base, ".png")),
+            plot = p,
+            width = width,
+            height = height,
+            dpi = 300
+        )
+        
+        ggsave(
+            filename = file.path(output_dir, paste0(filename_base, ".pdf")),
+            plot = p,
+            width = width,
+            height = height
+        )
+        
+        message("Saved barplot as PNG and PDF: ", filename_base)
+    }
+    
+    return(p)
+}
+```
+
+Individual
+
+```{r}
+plot_endosymbiont_barplot_individual <- function(
+    ps_object,
+    taxrank = "Genus",
+    grouping_vars = c("Location"),
+    facet_by = NULL,
+    output_dir = NULL,
+    width = 10,
+    height = 6,
+    save_plot = FALSE,
+    free_y_in_facets = TRUE
+) {
+    require(tidyverse)
+    require(phyloseq)
+    require(scales)
+    
+    # agglomerate
+    ps_tax <- tax_glom(ps_object, taxrank = taxrank, NArm = FALSE)
+    
+    # OTU table
+    otu <- as.data.frame(otu_table(ps_tax))
+    if (taxa_are_rows(ps_tax)) otu <- t(otu)
+    
+    # tax labels
+    tax_df <- as.data.frame(tax_table(ps_tax))
+    tax_labels <- tax_df[[taxrank]]
+    tax_labels[is.na(tax_labels)] <- "Unknown"
+    tax_labels <- gsub(" ", "_", tax_labels)
+    colnames(otu) <- tax_labels
+    
+    # rel abundance
+    otu_rel <- otu / rowSums(otu)
+    otu_rel[is.na(otu_rel)] <- 0
+    
+    # metadata
+    meta <- as(sample_data(ps_tax), "data.frame")
+    if ("Location" %in% colnames(meta)) {
+        meta$Location <- factor(meta$Location, levels = c("UP", "DWN"))
+    }
+    if ("Taxa" %in% colnames(meta)) {
+        meta$Taxa <- factor(meta$Taxa, levels = c("Chironomidae", "Heptageniidae", "Hydropsychidae", "Araneid", "Tetragnatha"))
+    }
+    if ("Lifestage" %in% colnames(meta)) {
+        meta$Lifestage <- factor(meta$Lifestage, levels = c("Larvae", "Adult", "Spider"))
+    }
+    
+    # algining
+    shared_ids <- intersect(rownames(otu_rel), rownames(meta))
+    otu_rel <- otu_rel[shared_ids, , drop = FALSE]
+    meta <- meta[shared_ids, , drop = FALSE]
+    
+    # long format
+    plot_df <- otu_rel %>%
+        as_tibble(rownames = "SampleID") %>%
+        pivot_longer(-SampleID, names_to = "Taxon", values_to = "Abundance") %>%
+        left_join(meta %>% rownames_to_column("SampleID"), by = "SampleID")
+    
+    # filter to endosymbionts
+    plot_df <- plot_df %>%
+        filter(Taxon %in% endo_genera)
+    
+    if (nrow(plot_df) == 0) {
+        message("No endosymbiont taxa present at ", taxrank, " level in the dataset.")
+        return(NULL)
+    }
+    
+    # calc mean ± SE per group and taxon
+    summary_df <- plot_df %>%
+        group_by(!!!syms(c(grouping_vars, "Taxon", facet_by))) %>%
+        summarise(
+            mean_abundance = mean(Abundance),
+            se_abundance = sd(Abundance) / sqrt(n()),
+            .groups = "drop"
+        )
+    
+    # yaxis limits
+    if (!free_y_in_facets) {
+        # Single global limit
+        max_mean <- max(summary_df$mean_abundance + summary_df$se_abundance)
+        y_limit <- min(1, max_mean * 1.15)
+        y_scale <- scale_y_continuous(
+            labels = percent_format(accuracy = 0.1),
+            expand = expansion(mult = c(0, 0)),
+            limits = c(0, y_limit)
+        )
+    } else {
+        # Per-facet limit: headroom = 15% above the tallest bar+SE in each facet
+        facet_limits <- summary_df %>%
+            group_by(!!!syms(facet_by)) %>%
+            summarise(
+                y_max = min(1, max(mean_abundance + se_abundance, na.rm = TRUE) * 1.15),
+                .groups = "drop"
+            )
+        summary_df <- summary_df %>%
+            left_join(facet_limits, by = facet_by)
+        
+       
+        y_scale <- scale_y_continuous(
+            labels = percent_format(accuracy = 0.1),
+            expand = expansion(mult = c(0, 0))
+        )
+    }
+#plot
+    p <- ggplot(summary_df, aes(
+        x = .data[[grouping_vars[1]]],
+        y = mean_abundance,
+        fill = Taxon
+    )) +
+        geom_bar(stat = "identity",
+                 position = position_dodge(width = 0.9),
+                 color = "black",
+                 alpha = 0.85) +
+        geom_errorbar(
+            aes(
+                ymin = pmax(0, mean_abundance - se_abundance),
+                ymax = mean_abundance + se_abundance
+            ),
+            position = position_dodge(width = 0.9),
+            width = 0.2
+        ) +
+        # invisible points to set ceiling for plto
+        { if (free_y_in_facets)
+            geom_blank(aes(y = y_max))
+          else
+            NULL
+        } +
+
+        y_scale +
+        labs(
+            title = paste0("Endosymbiont Relative Abundance (", taxrank, ")"),
+            y = "Relative Abundance (%)",
+            x = grouping_vars[1],
+            fill = taxrank
+        ) +
+        theme_bw(base_size = 14) +
+        theme(
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "right"
+        )
+    
+    if (!is.null(facet_by)) {
+        facet_formula <- as.formula(paste("~", paste(facet_by, collapse = "+")))
+        p <- p + facet_wrap(
+            facet_formula,
+            scales = if (free_y_in_facets) "free_y" else "fixed",
+            nrow = 4
+        )
+    }
+    
+    # saving
+    if (save_plot && !is.null(output_dir)) {
+        filename_base <- paste0(
+            "IND_Barplot_RA_Endosymbionts_", taxrank, "_",
+            paste(grouping_vars, collapse = "_"),
+            if (!is.null(facet_by)) paste0("_facet_", paste(facet_by, collapse = "_")) else "",
+            if (free_y_in_facets) "_freeY" else "_fixedY"
+        )
+        ggsave(file.path(output_dir, paste0(filename_base, ".png")), plot = p, width = width, height = height, dpi = 300)
+        ggsave(file.path(output_dir, paste0(filename_base, ".pdf")), plot = p, width = width, height = height)
+        message("Saved barplot as PNG and PDF: ", filename_base)
+    }
+    
+    return(list(plot = p, plot_df = plot_df))
+}
+```
+
+## Total endosymbiont plot
+
+```{r}
+p <- plot_endosymbiont_barplot2(
+    ps_object = ps_final,
+    taxrank = "Genus",
+    grouping_vars = c("Location", "Lifestage", "Taxa"),
+    facet_by = c("Taxa", "Lifestage"),
+    output_dir = output_dir,
+    width = 10,
+    height = 6,
+    save_plot = TRUE#,
+  #  free_y_in_facets = TRUE
+)
+p
+```
+
+## Ind. endosymbiont plot
+
+```{r}
+#free y within facet
+p <- plot_endosymbiont_barplot_individual(
+    ps_object = ps_final,
+    taxrank = "Genus",
+    grouping_vars = c("Location"),
+    facet_by = c("Taxa", "Lifestage"),
+    output_dir = output_dir,
+    width = 10,
+    height = 10,
+    save_plot = TRUE,
+    free_y_in_facets = TRUE
+)
+p
+
+plot_df <- p$plot_df
+
+#facet with fixed y axis
+p2 <- plot_endosymbiont_barplot_individual(
+    ps_object = ps_final,
+    taxrank = "Genus",
+    grouping_vars = c("Location"),
+    facet_by = c("Taxa", "Lifestage"),
+    output_dir = output_dir,
+    width = 10,
+    height = 10,
+    save_plot = TRUE,
+    free_y_in_facets = FALSE
+)
+p2
+
+```
+
+# Test for significant differences in total endosymbiont abundances
+
+```{r}
+library(dplyr)
+library(purrr)
+
+# compute total endosymbiont abundance per sample, life stage, and taxon
+total_endo <- plot_df %>%
+  group_by(SampleID, Lifestage, Taxa, Location) %>%
+  summarise(Total_Endosymbiont = sum(Abundance), .groups = "drop")
+
+overall_total_endo <- plot_df %>%
+  group_by(Lifestage, Taxa, Location) %>%
+  summarise(Total_Endosymbiont = sum(Abundance), .groups = "drop")
+overall_total_endo
+
+#all combinations of Lifestage and Taxa
+combinations <- total_endo %>%
+  distinct(Lifestage, Taxa)
+
+# Kruskal-Wallis for each combination
+kw_results <- combinations %>%
+  pmap_df(function(Lifestage, Taxa){
+    
+    data_subset <- total_endo %>%
+      filter(Lifestage == !!Lifestage, Taxa == !!Taxa)
+    
+    # Only run test if both locations have data
+    if(length(unique(data_subset$Location)) > 1){
+      test <- kruskal.test(Total_Endosymbiont ~ Location, data = data_subset)
+      tibble(
+        Lifestage = Lifestage,
+        Taxa = Taxa,
+        chi_sq = test$statistic,
+        df = test$parameter,
+        p_value = test$p.value
+      )
+    } else {
+      tibble(
+        Lifestage = Lifestage,
+        Taxa = Taxa,
+        chi_sq = NA,
+        df = NA,
+        p_value = NA
+      )
+    }
+  })
+
+# adj p-values for multiple testing (Benjamini-Hochberg)
+kw_results <- kw_results %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+kw_results
+
+```

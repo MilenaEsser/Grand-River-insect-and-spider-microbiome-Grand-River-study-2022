@@ -1,0 +1,1218 @@
+---
+title: "GrandRiver22:microbiome_MaAsLin3 (Multivariate Association with Linear Models) analysis"
+author: "Milena Esser"
+date: "2025-05-20"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+Different from other differential abundance tools, low prevalence features need not be filtered out since the prevalence modeling in MaAsLin 3 already accounts for high proportions of zeros. However, filtering low prevalence features might improve power.
+
+There are also a few rules of thumb to keep in mind.
+
+- Models should ideally have about 10 times as many samples (all samples for logistic fits, non-zero samples for linear fits) as covariate terms (all continuous variables plus all categorical variable levels).
+
+- Coefficients (effect sizes) larger than about 15 in absolute value are usually suspect unless very small unstandardized predictors are being included. (A coefficient of 15 corresponds to a fold change \>30000!). If you encounter such coefficients, check that (1) no error was thrown, (2) the diagnostics look reasonable, (3) a sufficient number of samples were used in fitting, (4) the q-value is significant, (5) the metadata are not highly collinear, and (6) the random effects are plausible.
+
+Maaslin3 Model Selection Strategy\
+In Maaslin3, you specify:
+
+- `fixed_effects`: variables you want to test or control for
+
+- `random_effects`: grouping variables to account for non-independence (e.g., repeated measures)
+
+Based on this, I selected site (city: WAT, KIT, CAL, HESP) as random factors. However, we only have 4 levels in site, therefore I will try and run it with small_random_effects=TRUE, as otherwise the model may be too unstable. Another alternative would be to run all as fixed levels.
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+rm(list=ls())
+par(mar = c(2, 2, 2, 2)) 
+###Loading packages
+library(phyloseq) 
+library(ggplot2)
+library(ggtext)
+library(plyr) 
+library(dplyr) 
+library(vegan)
+library(tidyverse) 
+library(knitr) 
+library(RColorBrewer)
+library(ggpubr)
+library(picante)
+library(ggh4x) 
+library(multcompView)
+library(data.table)
+library(scales)
+
+library(maaslin3)
+```
+
+## Loading Data
+
+Loading the phyloseq objects
+
+```{r Loading-data-maaslin3}
+#not rarefied dataset "ps_final"
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_unnorm.RData")
+
+```
+
+Create output directory
+
+```{r create-maaslin3-output-dir}
+# Create output directory
+output_dir <- file.path("R_output", "MaAsLin3_Genus")
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  message("Output directory created: ", output_dir)
+} else {
+  message("Output directory already exists: ", output_dir)
+}
+```
+
+#### Prepare data for analysis
+
+```{r prep-data-for-maaslin3}
+#Prepare data for analysis
+#Extract abundance (e.g., genus level) Species recommended
+ps<- tax_glom(ps_final, taxrank = "Genus")
+
+otu <- as.data.frame(otu_table(ps))  # Features
+if (taxa_are_rows(ps)) {
+  otu <- t(otu)
+}
+ 
+otu <- as.data.frame(otu)
+otu <- otu[, sapply(otu, is.numeric)]
+
+#metadata
+meta <- as(sample_data(ps), "data.frame")
+
+sapply(meta[, c("Location", "Site")], class)
+str(meta[, c("Location", "Site")])
+
+meta$Location <- factor(meta$Location,
+                               levels = c("UP", "DWN"))
+
+# dropping rows not shared between OTU and meta
+shared_ids <- intersect(rownames(otu), rownames(meta))
+otu <- otu[shared_ids, , drop = FALSE]
+meta <- meta[shared_ids, , drop = FALSE]
+
+# Sort to make sure sample order matches
+otu <- otu[order(rownames(otu)), ]
+meta <- meta[order(rownames(meta)), ]
+
+# Extract taxonomy table from phyloseq
+tax_table_df <- as.data.frame(tax_table(ps))
+
+# Make sure rownames are ASV IDs (should be already)
+taxonomy_df <- tax_table_df
+
+# Optional: check taxonomy columns
+head(taxonomy_df)
+
+# Add read depth
+meta$read_depth <- sample_sums(ps)
+
+# scale to thousands for interpretability
+meta$read_depth_k <- meta$read_depth / 1000
+
+#check
+meta$read_depth
+```
+
+```{r rename-otu-table-to-include-species-names}
+
+# replace spaces or NAs if present
+taxonomy_df$Genus[is.na(taxonomy_df$Genus)] <- "Unknown"
+taxonomy_df$Genus <- gsub(" ", "_", taxonomy_df$Genus)
+
+# Assign ASV names (rownames in taxonomy_df) to this new column for easy matching
+name_map <- taxonomy_df$Genus
+names(name_map) <- rownames(taxonomy_df)
+
+# Rename OTU table columns using the name map, but only where there is a match
+colnames(otu) <- ifelse(colnames(otu) %in% names(name_map),
+                        name_map[colnames(otu)],
+                        colnames(otu))  # leave unmatched ASVs as-is
+otu
+```
+
+```{r prevalence-filter}
+#taxa present in at least x% samples
+prevalence_threshold <- 0.05
+prevalent_taxa <- colnames(otu)[colSums(otu > 0) >= prevalence_threshold * nrow(otu)]
+otu_filtered <- otu[, prevalent_taxa]
+
+cat("Prevalence filter",prevalence_threshold, ": Kept", length(prevalent_taxa), "taxa out of", ncol(otu), "\n")
+```
+
+## MaAsLin3 full community model
+
+runnin full community meaning no separation before analysis. Spiders are run separately as they don't have different lifestages.
+
+```{r maaslin3-full-community-model}
+# Subset to samples with Lifestage 
+meta_full <- meta 
+
+# Ensure factors
+meta_full$Site <- factor(meta_full$Site)
+meta_full$Location <- factor(meta_full$Location)
+meta_full$Lifestage <- factor(meta_full$Lifestage)
+meta_full$Taxa <- factor(meta_full$Taxa)
+
+# Subset OTU to matching samples
+otu_full <- otu_filtered[rownames(meta_full), , drop = FALSE]
+
+# Ensure same order
+otu_full <- otu_full[order(rownames(otu_full)), ]
+meta_full <- meta_full[order(rownames(meta_full)), ]
+
+stopifnot(identical(rownames(otu_full), rownames(meta_full)))
+
+# Create output folder
+output_full <- file.path(output_dir, "MaAsLin3_Full_Model")
+
+# Remove the existing output folder if it exists
+if (dir.exists(output_full)) {
+    message("Cleaning output directory: ", output_full)
+    success <- unlink(output_full, recursive = TRUE, force = TRUE)
+    if (success == 0) {
+      message("Successfully removed: ", output_full)
+    } else {
+      warning("Failed to remove: ", output_full)
+    }
+}
+
+# Recreate the output folder cleanly
+dir.create(output_full, recursive = TRUE, showWarnings = FALSE)
+message("Output directory created: ", output_full)
+
+# Run MaAsLin3
+fit_full <- maaslin3(
+  input_data = otu_full,
+  input_metadata = meta_full,
+  output = output_full,
+  formula = "~ Location + Taxa+ Lifestage + read_depth + (1 | Site)",
+  normalization = "TSS",
+  transform = "LOG",
+  correction = "BH",
+  summary_plot_first_n = 25,
+  standardize = TRUE,
+  small_random_effects = TRUE,
+  max_significance = 0.1 # optional for exploratory inclusiveness
+)
+```
+
+### Excluding Spiders
+
+```{r maaslin-excluding-spiders}
+# Subset to samples with Lifestage 
+meta_mac <- meta %>% filter(Lifestage != "Spider")
+
+# Ensure factors
+meta_mac$Site <- factor(meta_mac$Site)
+meta_mac$Location <- factor(meta_mac$Location)
+meta_mac$Lifestage <- factor(meta_mac$Lifestage)
+meta_mac$Taxa <- factor(meta_mac$Taxa)
+
+# Subset OTU to matching samples
+otu_mac <- otu_filtered[rownames(meta_mac), , drop = FALSE]
+
+# Ensure same order
+otu_mac <- otu_mac[order(rownames(otu_mac)), ]
+meta_mac <- meta_mac[order(rownames(meta_mac)), ]
+
+stopifnot(identical(rownames(otu_mac), rownames(meta_mac)))
+
+# Create output folder
+output_mac <- file.path(output_dir, "MaAsLin3_macroinvertebrate_only")
+
+# Remove the existing output folder if it exists
+if (dir.exists(output_mac)) {
+    message("Cleaning output directory: ", output_mac)
+    success <- unlink(output_mac, recursive = TRUE, force = TRUE)
+    if (success == 0) {
+      message("Successfully removed: ", output_mac)
+    } else {
+      warning("Failed to remove: ", output_mac)
+    }
+}
+
+# Recreate the output folder cleanly
+dir.create(output_mac, recursive = TRUE, showWarnings = FALSE)
+message("Output directory created: ", output_mac)
+
+# Run MaAsLin3
+fit_mac <- maaslin3(
+  input_data = otu_mac,
+  input_metadata = meta_mac,
+  output = output_mac,
+  formula = "~ Location + Taxa + Lifestage + read_depth + (1 | Site)",
+  normalization = "TSS",
+  transform = "LOG",
+  correction = "BH",
+  summary_plot_first_n = 25,
+  standardize = TRUE,
+  small_random_effects = TRUE,
+  max_significance = 0.1 # optional for exploratory 
+)
+```
+
+### Spiders only
+
+```{r Maaaslin3-spiders}
+# Subset to spiders only
+meta_spider <- meta %>% filter(Lifestage == "Spider")
+
+meta_spider$Site <- factor(meta_spider$Site)
+meta_spider$Location <- factor(meta_spider$Location)
+meta_spider$Taxa <- factor(meta_spider$Taxa)
+
+otu_spider <- otu_filtered[rownames(meta_spider), , drop = FALSE]
+
+otu_spider <- otu_spider[order(rownames(otu_spider)), ]
+meta_spider <- meta_spider[order(rownames(meta_spider)), ]
+
+stopifnot(identical(rownames(otu_spider), rownames(meta_spider)))
+
+#create output directory
+output_spider <- file.path(output_dir, "MaAsLin3_Spiders")
+
+# Remove the existing output folder if it exists
+if (dir.exists(output_spider)) {
+    message("Cleaning output directory: ", output_spider)
+    success <- unlink(output_spider, recursive = TRUE, force = TRUE)
+    if (success == 0) {
+      message("Successfully removed: ", output_spider)
+    } else {
+      warning("Failed to remove: ", output_spider)
+    }
+}
+
+# Recreate the output folder cleanly
+dir.create(output_spider, recursive = TRUE, showWarnings = FALSE)
+message("Output directory created: ", output_spider)
+
+#run maaslin3
+fit_spider <- maaslin3(
+  input_data = otu_spider,
+  input_metadata = meta_spider,
+  output = output_spider,
+  formula = "~ Location + read_depth + Taxa + (1 | Site)",
+  normalization = "TSS",
+  transform = "LOG",
+  correction = "BH",
+  summary_plot_first_n = 25,
+  standardize = TRUE,
+  small_random_effects = TRUE,
+  max_significance = 0.1
+)
+```
+
+## MaAsLin3 by taxon
+
+fixed effects: Location, Lifestage (for macroinverts only), sequencing_depth
+
+random effects: Site (small_random_effects=TRUE)
+
+```{r maaslin3-by-taxon}
+
+# Customize this as needed
+taxa_list <- unique(meta$Taxa)
+
+output_base <- file.path(output_dir, "MaAsLin3_by_taxon")
+
+# Remove the existing output folder if it exists
+if (dir.exists(output_base)) {
+    message("Cleaning output directory: ", output_base)
+    success <- unlink(output_base, recursive = TRUE, force = TRUE)
+    if (success == 0) {
+      message("Successfully removed: ", output_base)
+    } else {
+      warning("Failed to remove: ", output_base)
+    }
+}
+
+# Recreate the output folder cleanly
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+message("Output directory created: ", output_base)
+
+
+# Loop over each taxon
+for (taxon in unique(meta$Taxa)) {
+  message("Processing: ", taxon)
+
+  # Subset metadata
+  meta_sub <- subset(meta, Taxa == taxon)
+  
+  # Convert fixed effects to factors
+meta_sub$Site <- factor(meta_sub$Site)
+meta_sub$Location <- factor(meta_sub$Location)
+meta_sub$Lifestage <- factor(meta_sub$Lifestage)
+  
+  # Skip if too few samples
+  if (nrow(meta_sub) < 10) {
+    message("  Skipping (too few samples)")
+    next
+  }
+
+  # Skip if not both life stages
+  if (length(unique(meta_sub$Lifestage)) < 2) {
+    message("  Skipping (not both life stages)")
+    next
+  }
+
+  # Subset OTU
+  otu_sub <- otu_filtered[rownames(meta_sub), , drop = FALSE]
+
+  # Drop features with no variance
+  otu_sub <- otu_sub[, apply(otu_sub, 2, var) > 0]
+
+  # Match sample order
+  meta_sub <- meta_sub[order(rownames(meta_sub)), ]
+  otu_sub <- otu_sub[order(rownames(otu_sub)), ]
+  stopifnot(identical(rownames(meta_sub), rownames(otu_sub)))
+
+  # Define output directory for taxon
+  output_dir_tax <- file.path(output_base, paste0("Taxon_", gsub("[^A-Za-z0-9]", "_", taxon)))
+  dir.create(output_dir_tax, recursive = TRUE, showWarnings = FALSE)
+
+  # Run MaAsLin3
+  fit_data <-maaslin3(
+    input_data = otu_sub,
+    input_metadata = meta_sub,
+    output = output_dir_tax,
+    formula = "~ Location + Lifestage + read_depth + (1 | Site)",
+    normalization = "TSS",
+    transform = "LOG",
+    correction = "BH",
+    summary_plot_first_n = 25,
+    standardize = T,
+     small_random_effects=TRUE
+  )
+}
+```
+
+### MaAsLin3 for spiders
+
+Formula used: *\~ Location +sequencing depth + (1 \| Site)*
+
+```{r maaslin3-spiders}
+#Since spiders don't have lifestage as variable, I run it separately.
+
+# Subset to spiders only
+meta_spider <- subset(meta, Lifestage == "Spider")
+
+#create taxa list
+taxa_list <- unique(meta_spider$Taxa)
+
+output_base <- file.path(output_dir, "MaAsLin3_by_taxon")
+
+
+# Loop over each taxon
+for (taxon in unique(meta_spider$Taxa)) {
+  message("Processing: ", taxon)
+
+  # Subset metadata
+  meta_sub <- subset(meta_spider, Taxa == taxon)
+  
+  # Convert fixed effects to factors
+meta_sub$Site <- factor(meta_sub$Site)
+meta_sub$Location <- factor(meta_sub$Location)
+  
+  # Skip if too few samples
+  if (nrow(meta_sub) < 10) {
+    message("  Skipping (too few samples)")
+    next
+  }
+
+  # Subset OTU
+  otu_sub <- otu_filtered[rownames(meta_sub), , drop = FALSE]
+
+  # Drop features with no variance
+  otu_sub <- otu_sub[, apply(otu_sub, 2, var) > 0]
+
+  # Match sample order
+  meta_sub <- meta_sub[order(rownames(meta_sub)), ]
+  otu_sub <- otu_sub[order(rownames(otu_sub)), ]
+  stopifnot(identical(rownames(meta_sub), rownames(otu_sub)))
+
+  # Define output directory for taxon
+  output_dir_tax <- file.path(output_base, paste0("Taxon_", gsub("[^A-Za-z0-9]", "_", taxon)))
+  dir.create(output_dir_tax, recursive = TRUE, showWarnings = FALSE)
+
+  # Run MaAsLin3
+  fit_data <-maaslin3(
+    input_data = otu_sub,
+    input_metadata = meta_sub,
+    output = output_dir_tax,
+    formula = "~ Location + read_depth + (1 | Site)",
+    normalization = "TSS",
+    transform = "LOG",
+    correction = "BH",
+    summary_plot_first_n = 25,
+    standardize = T,
+     small_random_effects=TRUE
+  )
+}
+```
+
+## MaAsLin3 by Lifestage
+
+fixed effects: Location, sequencing depth
+
+random effects: Site (can only use on random factor)
+
+small_random_effects=TRUE
+
+```{r maaslin3-by-lifestage}
+# Customize this as needed
+lifestage_list <- unique(meta$Lifestage)
+
+output_base <- file.path(output_dir, "MaAsLin3_by_Lifestage")
+
+# Remove the existing output folder if it exists
+if (dir.exists(output_base)) {
+    message("Cleaning output directory: ", output_base)
+    success <- unlink(output_base, recursive = TRUE, force = TRUE)
+    if (success == 0) {
+      message("Successfully removed: ", output_base)
+    } else {
+      warning("Failed to remove: ", output_base)
+    }
+}
+
+# Recreate the output folder cleanly
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+message("Output directory created: ", output_base)
+
+# Loop over each Sample_Type
+for (lifestage in lifestage_list) {
+  message("Processing: ", lifestage)
+
+  # Subset metadata
+  meta_sub <- subset(meta, Lifestage == lifestage)
+
+  # Convert fixed effects to factors
+  meta_sub$Site <- factor(meta_sub$Site)
+  meta_sub$Location <- factor(meta_sub$Location)
+
+  # Skip if too few samples
+  if (nrow(meta_sub) < 10) {
+    message("  Skipping (too few samples)")
+    next
+  }
+
+  # Subset OTU
+  otu_sub <- otu_filtered[rownames(meta_sub), , drop = FALSE]
+
+  # Drop features with no variance
+  otu_sub <- otu_sub[, apply(otu_sub, 2, var) > 0]
+
+  # Match sample order
+  meta_sub <- meta_sub[order(rownames(meta_sub)), ]
+  otu_sub <- otu_sub[order(rownames(otu_sub)), ]
+  stopifnot(identical(rownames(meta_sub), rownames(otu_sub)))
+
+  # Define output directory for Sample_Type
+  output_dir_st <- file.path(output_base, paste0("lifestage_", gsub("[^A-Za-z0-9]", "_", lifestage)))
+  dir.create(output_dir_st, recursive = TRUE, showWarnings = FALSE)
+
+  formula_to_use <- "~ Location + read_depth + (1 | Site)"
+
+  
+  # Run MaAsLin3
+  fit_data <- maaslin3(
+  input_data = otu_sub,
+  input_metadata = meta_sub,
+  output = output_dir_st,
+  formula = formula_to_use,
+  normalization = 'TSS',
+  transform = 'LOG',
+  augment = TRUE,
+  max_significance = 0.1,
+  verbosity = "DEBUG",
+  small_random_effects = TRUE,
+  standardize = T
+)
+}
+```
+
+## MaAsLin3 by sample type
+
+\~ Location + read_depth + (1 \| Site)
+
+small_random_effects=TRUE
+
+```{r maaslin3-by-sample-type}
+# Customize this as needed
+sample_type_list <- unique(meta$Sample_Type)
+
+output_base <- file.path(output_dir, "MaAsLin3_by_Sample_Type")
+
+# Remove the existing output folder if it exists
+if (dir.exists(output_base)) {
+    message("Cleaning output directory: ", output_base)
+    success <- unlink(output_base, recursive = TRUE, force = TRUE)
+    if (success == 0) {
+      message("Successfully removed: ", output_base)
+    } else {
+      warning("Failed to remove: ", output_base)
+    }
+}
+
+# Recreate the output folder cleanly
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+message("Output directory created: ", output_base)
+
+# Loop over each Sample_Type
+for (sample_type in sample_type_list) {
+  message("Processing: ", sample_type)
+
+  # Subset metadata
+  meta_sub <- subset(meta, Sample_Type == sample_type)
+# Drop NAs in Taxa
+  meta_sub <- meta_sub[!is.na(meta_sub$Taxa), ]
+
+  # Convert fixed effects to factors
+  meta_sub$Site <- factor(meta_sub$Site)
+  meta_sub$Location <- factor(meta_sub$Location)
+  
+
+  # Subset OTU
+  otu_sub <- otu_filtered[rownames(meta_sub), , drop = FALSE]
+
+  # Drop features with no variance
+  otu_sub <- otu_sub[, apply(otu_sub, 2, var) > 0]
+
+  # Match sample order
+  meta_sub <- meta_sub[order(rownames(meta_sub)), ]
+  otu_sub <- otu_sub[order(rownames(otu_sub)), ]
+  stopifnot(identical(rownames(meta_sub), rownames(otu_sub)))
+
+  # Define output directory for Sample_Type
+  output_dir_st <- file.path(output_base, paste0("Sample_Type_", gsub("[^A-Za-z0-9]", "_", sample_type)))
+  dir.create(output_dir_st, recursive = TRUE, showWarnings = FALSE)
+
+  # Run MaAsLin3
+  fit_data <- maaslin3(
+    input_data = otu_sub,
+    input_metadata = meta_sub,
+    output = output_dir_st,
+    formula = "~ Location + read_depth + (1 | Site)",
+                    normalization = 'TSS',
+                    transform = 'LOG',
+                    augment = TRUE, #to avoid linear separability in the logistic regressions, almost always recommended
+                    standardize = TRUE, #standardize numeric/continous variables in meta
+                    max_significance = 0.1,
+    small_random_effects=TRUE,
+    verbosity="ERROR" #only show errors
+     )
+}
+```
+
+## Summary
+
+```{r extract-significant-res}
+# Automatically find all MaAsLin3 output directories
+maaslin_output_dirs <- list.dirs(output_dir, recursive = TRUE, full.names = TRUE)
+maaslin_output_dirs <- maaslin_output_dirs[grepl("MaAsLin3", maaslin_output_dirs)]
+
+# === USER PARAMETERS ===
+qval_cutoff <- 0.05
+
+# === Collect all MaAsLin3 result folders automatically ===
+maaslin_output_dirs <- list.dirs(output_dir, recursive = TRUE, full.names = TRUE)
+maaslin_output_dirs <- maaslin_output_dirs[grepl("MaAsLin3", maaslin_output_dirs)]
+
+# === Initialize collector ===
+all_sig_results <- list()
+
+# === Extraction loop ===
+for (dir in maaslin_output_dirs) {
+  message("Scanning in: ", dir)
+
+  result_files <- list.files(
+    path = dir,
+    pattern = "all_results.tsv",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+  for (file in result_files) {
+    message("Reading: ", file)
+
+    df <- tryCatch(
+      readr::read_tsv(file, show_col_types = FALSE),
+      error = function(e) {
+        message("Error reading file: ", file)
+        return(NULL)
+      }
+    )
+    if (is.null(df) || nrow(df) == 0) next
+
+    # Annotate with context (folder above the file)
+    context <- basename(dirname(file))
+
+    # Filter by significance
+    df_sig <- df %>%
+      filter(qval_joint <= qval_cutoff) %>%
+      mutate(
+        Source_Context = context,
+        Source_File = basename(file),
+        Source_Path = file
+      )
+
+    if (nrow(df_sig) > 0) {
+      all_sig_results[[length(all_sig_results) + 1]] <- df_sig
+    }
+  }
+}
+
+
+if (length(all_sig_results) > 0) {
+  combined_sig_df <- dplyr::bind_rows(all_sig_results) %>%
+    select(
+      feature, metadata, value, name, coef,
+      stderr, pval_joint, qval_joint,
+      model, N, N_not_zero,
+      Source_Context, Source_File, Source_Path
+    ) %>%
+    arrange(qval_joint)
+
+  # Export 
+  output_file <- file.path(output_dir, "MaAsLin3_All_Significant_Results.csv")
+  readr::write_csv(combined_sig_df, output_file)
+  message("Combined significant results saved to: ", output_file)
+
+} else {
+  message("No significant results found at qval_joint <= ", qval_cutoff)
+  combined_sig_df <- tibble::tibble()
+}
+
+#Plot
+if (nrow(combined_sig_df) > 0) {
+
+  meta_vars_to_plot <- c("Location", "Lifestage", "Sample_Type")
+  top_n <- 20  #max number plotted
+  plot_df <- combined_sig_df %>%
+    filter(metadata %in% meta_vars_to_plot[meta_vars_to_plot %in% unique(combined_sig_df$metadata)]) %>%
+    mutate(
+      feature_clean = stringr::str_replace_all(feature, "_", " "),
+      Context = dplyr::case_when(
+        grepl("^Taxon_", Source_Context) ~ stringr::str_replace(Source_Context, "Taxon_", "Taxon: "),
+        grepl("^Sample_Type_", Source_Context) ~ stringr::str_replace(Source_Context, "Sample_Type_", "Sample Type: "),
+        grepl("^lifestage_", Source_Context) ~ stringr::str_replace(Source_Context, "lifestage_", "Lifestage: "),
+        TRUE ~ Source_Context
+      ),
+      Context = factor(Context),
+      Sign = if_else(coef >= 0, "Positive", "Negative")
+    ) %>%
+    filter(!is.na(coef))
+
+  plot_by_metadata <- function(data, meta_value) {
+    df_sub <- data %>%
+      filter(metadata == meta_value) %>%
+      group_by(Context) %>%
+      slice_min(order_by = qval_joint, n = top_n, with_ties = FALSE) %>%
+      ungroup()
+
+    if (nrow(df_sub) == 0) {
+      message("No data available to plot for metadata: ", meta_value)
+      return(
+        ggplot() +
+          theme_void() +
+          labs(title = paste("No significant associations for", meta_value))
+      )
+    }
+
+    message("Generating plot for metadata: ", meta_value)
+
+    ggplot(df_sub, aes(
+      x = coef,
+      y = forcats::fct_reorder(feature_clean, coef),
+      color = model,
+      shape = model
+    )) +
+      geom_point(size = 5, alpha = 0.9) +
+      geom_errorbarh(aes(xmin = coef - stderr, xmax = coef + stderr), height = 0.4, alpha = 0.7) +
+      facet_grid(rows = vars(Context), scales = "free_y", space = "free_y") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+      scale_color_manual(values = c("abundance" = "#1b9e77", "prevalence" = "#d95f02"), na.translate = FALSE) +
+      scale_shape_manual(values = c("abundance" = 16, "prevalence" = 17)) +
+      labs(
+        x = "Effect Size (Coefficient ± SE)",
+        y = "Feature",
+        color = "Model",
+        shape = "Model",
+        title = paste("Top", top_n, "Significant Associations by", meta_value)
+      ) +
+      theme_bw(base_size = 24) +
+      theme(
+        strip.text = element_text(size = 26, face = "bold"),
+        axis.text.y = element_text(size = 20),
+        axis.text.x = element_text(size = 20),
+        axis.title = element_text(size = 22, face = "bold"),
+        legend.position = "bottom",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 22),
+        plot.title = element_text(size = 28, face = "bold")
+      )
+  }
+
+  n_facets <- length(unique(plot_df$Context))
+  facet_height <- 3.5
+  plot_height <- max(12, n_facets * facet_height)
+
+  for (meta_value in meta_vars_to_plot) {
+    if (!(meta_value %in% unique(plot_df$metadata))) {
+      message("Skipping: ", meta_value, " (not in results)")
+      next
+    }
+
+    plot_obj <- plot_by_metadata(plot_df, meta_value)
+    print(plot_obj)
+
+    ggsave(
+      filename = file.path(output_dir, paste0("MaAsLin3_", meta_value, "_Significant_Associations.png")),
+      plot = plot_obj,
+      width = 18,   
+      height = plot_height,
+      dpi = 450
+    )
+    message("Saved plot for metadata: ", meta_value, " at ", file.path(output_dir, paste0("MaAsLin3_", meta_value, "_Significant_Associations.png")))
+  }
+}
+
+
+combined_sig_df
+```
+
+### Check taxa abundances
+
+```{r eval= F}
+# Loop over each metadata variable to plot taxa abundances for significant taxa
+for (meta_var in meta_vars_to_plot) {
+  
+  message("Plotting taxa for metadata variable: ", meta_var)
+  
+  # Filter significant taxa for this metadata variable and qval < 0.05
+  sig_taxa <- combined_sig_df %>%
+    filter(metadata == meta_var, qval_joint <= 0.05) %>%
+    pull(feature) %>%
+    unique()
+  
+  # Check if any taxa present
+  if (length(sig_taxa) == 0) {
+    message("No significant taxa for ", meta_var)
+    next
+  }
+  
+  # Sometimes feature names have underscores vs spaces, try to clean them to match OTU colnames
+  # If  otu colnames have underscores, ensure matching format:
+  sig_taxa_clean <- sig_taxa %>% 
+    str_replace_all(" ", "_")
+  
+  # Keep only taxa present in OTU table
+  sig_taxa_clean <- sig_taxa_clean[sig_taxa_clean %in% colnames(otu_filtered)]
+  
+  if (length(sig_taxa_clean) == 0) {
+    message("No matching taxa found in OTU table for ", meta_var)
+    next
+  }
+  
+  # Subset abundance data for these taxa
+  abund_sub <- otu_filtered[, sig_taxa_clean, drop = FALSE]
+  
+  # Add sample IDs to abund_sub
+  abund_sub$SampleID <- rownames(abund_sub)
+  
+  # Convert to long format for ggplot
+  abund_long <- abund_sub %>%
+    pivot_longer(cols = -SampleID, names_to = "Taxon", values_to = "Abundance")
+  
+  # Join with metadata
+  abund_long <- abund_long %>%
+    left_join(meta %>% mutate(SampleID = rownames(meta)), by = "SampleID")
+  
+  # plot abundance by meta_var groups, faceted by Taxon
+  # Replace meta_var with actual column in metadata
+  if (!(meta_var %in% colnames(meta))) {
+    message("Metadata variable ", meta_var, " not found in sample metadata, skipping.")
+    next
+  }
+  
+  p <- ggplot(abund_long, aes_string(x = meta_var, y = "Abundance", fill = meta_var)) +
+    geom_bar(stat = "summary", fun = "mean", position = position_dodge()) +
+    geom_jitter(width = 0.2, alpha = 0.5, size = 1, color = "black") +
+    facet_wrap(~ Taxon, scales = "free_y") +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste("Abundance of significant taxa by", meta_var),
+      y = "Mean abundance (TSS normalized counts)",
+      x = meta_var
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    guides(fill = guide_legend(title = meta_var))
+  
+  print(p)
+  
+  # save
+  ggsave(
+    filename = file.path(output_dir, paste0("MaAsLin3_", meta_var, "_Significant_Taxa_Abundance.png")),
+    plot = p,
+    width = 14,
+    height = 8,
+    dpi = 300
+  )
+}
+```
+
+#### Check specific taxa (lifestage comparison)
+
+```{r, eval=FALSE}
+#Corynebacterium_glyciniphilum
+#Alcaligenes_faecalis
+#Runella_limosa
+#Hydrogenophaga_taeniospiralis
+#Clostridium_sensu_stricto_13_estertheticum
+#Clostridium_sensu_stricto_5_cavendishii
+#Rhodobacter_blasticus
+
+# Define species of interest
+sp_taxon <- "Rhodobacter_blasticus"
+
+# Check presence in your OTU table
+col_to_use <- grep(sp_taxon, colnames(otu), value = TRUE)
+if (length(col_to_use) == 0) {
+  stop("No column found for ", sp_taxon, " in your OTU table.")
+}
+
+# Calculate relative abundance
+otu_rel <- otu / rowSums(otu)
+otu_rel[is.na(otu_rel)] <- 0
+
+# Create plotting dataframe
+plot_df <- meta %>%
+  mutate(
+    SampleID = rownames(meta),
+    Abundance = otu_rel[, col_to_use]
+  )
+
+# Replace zeroes with small value for log plotting
+plot_df <- plot_df %>%
+  mutate(Abundance_log = ifelse(Abundance == 0, 1e-5, Abundance))
+
+
+# Calculate summary table
+summary_df <- plot_df %>%
+  group_by(Lifestage, Location, Site) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Plot without facet, adding Site as part of x-axis grouping
+ggplot(summary_df, aes(x = interaction(Lifestage, Site, sep = " - "), y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean_abundance - se_abundance, ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance"),
+    y = "Relative Abundance (%)",
+    x = "Lifestage - Site"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+
+
+# Faceted barplot by Site
+ggplot(summary_df, aes(x = Lifestage, y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_abundance - se_abundance), ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  facet_wrap(~ Site) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance by Site"),
+    y = "Relative Abundance (%)",
+    x = "Lifestage"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+# Create summary ignoring Site
+summary_df_lifestage <- plot_df %>%
+  group_by(Lifestage, Location) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Barplot without Site, comparing Lifestage
+ggplot(summary_df_lifestage, aes(x = Lifestage, y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_abundance - se_abundance), ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance by Lifestage"),
+    y = "Relative Abundance (%)",
+    x = "Lifestage"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+
+# Create summary only compapring lifstages
+summary_df_lifestage <- plot_df %>%
+  group_by(Lifestage) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Barplot without Site, comparing Lifestage
+ggplot(summary_df_lifestage, aes(x = Lifestage, y = mean_abundance, fill = Lifestage)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_abundance - se_abundance), ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance by Lifestage"),
+    y = "Relative Abundance (%)",
+    x = "Lifestage"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+```
+
+#### Check specific taxa (location comparison)
+
+```{r check-specific-taxa-location-comp}
+#Hymenobacter_marinus
+#Staphylococcus_equorum
+#Flavobacterium_anseonense
+# Define species of interest
+sp_taxon <- "Flavobacterium_anseonense"
+
+# Check presence in your OTU table
+col_to_use <- grep(sp_taxon, colnames(otu), value = TRUE)
+if (length(col_to_use) == 0) {
+  stop("No column found for ", sp_taxon, " in your OTU table.")
+}
+
+# Calculate relative abundance
+otu_rel <- otu / rowSums(otu)
+otu_rel[is.na(otu_rel)] <- 0
+
+# Create plotting dataframe
+plot_df <- meta %>%
+  mutate(
+    SampleID = rownames(meta),
+    Abundance = otu_rel[, col_to_use]
+  )
+
+# Replace zeroes with small value for log plotting
+plot_df <- plot_df %>%
+  mutate(Abundance_log = ifelse(Abundance == 0, 1e-5, Abundance))
+
+
+# Calculate summary table
+summary_df <- plot_df %>%
+  group_by(Location, Site) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Plot without facet, adding Site as part of x-axis grouping
+ggplot(summary_df, aes(x = interaction(Location, Site, sep = " - "), y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean_abundance - se_abundance, ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance"),
+    y = "Relative Abundance (%)",
+    x = "Location - Site"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+
+
+# Faceted barplot by Site----------------------------
+
+# Calculate summary table
+summary_df <- plot_df %>%
+  group_by(Location, Site) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+
+ggplot(summary_df, aes(x = Location, y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_abundance - se_abundance), ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  facet_wrap(~ Site) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance by Site"),
+    y = "Relative Abundance (%)",
+    x = "Location"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+#facet barplot by taxon--------------------------------------
+
+# Calculate summary table
+summary_df <- plot_df %>%
+  group_by(Location, Taxa) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+
+ggplot(summary_df, aes(x = Location, y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_abundance - se_abundance), ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  facet_wrap(~ Taxa) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance by Taxon and location"),
+    y = "Relative Abundance (%)",
+    x = "Location"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+
+
+
+# Create summary ignoring Site-------------------------------
+summary_df_lifestage <- plot_df %>%
+  group_by( Location) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Barplot without Site, comparing Location
+ggplot(summary_df_lifestage, aes(x = Location, y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_abundance - se_abundance), ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance by Location"),
+    y = "Relative Abundance (%)",
+    x = "Location"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+
+
+# Create summary only compapring location-------------------
+summary_df_lifestage <- plot_df %>%
+  group_by(Location) %>%
+  summarise(
+    mean_abundance = mean(Abundance),
+    se_abundance = sd(Abundance) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Barplot without Site, comparing Location
+ggplot(summary_df_lifestage, aes(x = Location, y = mean_abundance, fill = Location)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), color = "black", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, mean_abundance - se_abundance), ymax = mean_abundance + se_abundance),
+    position = position_dodge(width = 0.8),
+    width = 0.2
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 0.01), expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = paste0(sp_taxon, " Mean Relative Abundance by Location"),
+    y = "Relative Abundance (%)",
+    x = "Location"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+```

@@ -1,0 +1,289 @@
+---
+title: "7_GrandRiverMB_pot_vertically_transmitted_taxa"
+author: "Milena Esser"
+date: "2025-07-16"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+This script creates euler diagrams to visualize the overlap and differences in diversity between larvae and adults in each aquatic insect assessed
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r setup, include=FALSE} knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls()) # Clean environment
+
+library(phyloseq)
+library(tidyverse)
+library(eulerr)
+library(gridExtra)
+library(grid)
+
+
+output_dir <- "R_output/Vertically_Transmitted_Taxa/Euler_plots"
+if(!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+```
+
+## Load data
+
+```{r load-data}
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_unnorm.RData")
+
+```
+
+Prepare Data
+
+```{r}
+
+# prep  data
+otu_mat <- as(otu_table(ps_final), "matrix")
+if(!taxa_are_rows(ps_final)) otu_mat <- t(otu_mat)
+
+meta <- data.frame(sample_data(ps_final)) %>%
+  filter(Lifestage %in% c("Larvae", "Adult"))  # remove spiders
+
+otu_mat <- otu_mat[, rownames(meta)]
+
+# function to create euler
+plot_taxon_euler <- function(taxon_name, otu_mat, meta){
+
+  meta_taxon <- meta %>% filter(Taxa == taxon_name)
+
+  larva_samples <- rownames(meta_taxon[meta_taxon$Lifestage=="Larvae",])
+  adult_samples <- rownames(meta_taxon[meta_taxon$Lifestage=="Adult",])
+
+  if(length(larva_samples)==0 | length(adult_samples)==0) return(NULL)
+
+  otu_larva <- otu_mat[, larva_samples, drop=FALSE]
+  otu_adult <- otu_mat[, adult_samples, drop=FALSE]
+
+  taxa_larva <- rownames(otu_larva)[rowSums(otu_larva) > 0]
+  taxa_adult <- rownames(otu_adult)[rowSums(otu_adult) > 0]
+
+  n_larva <- length(taxa_larva)
+  n_adult <- length(taxa_adult)
+  n_overlap <- length(intersect(taxa_larva, taxa_adult))
+
+  if(n_larva == 0 & n_adult == 0) return(NULL)
+
+  # Create Euler object
+  fit <- euler(c(
+    Larva = n_larva - n_overlap,     # use "Larva" for display
+    Adult  = n_adult - n_overlap,
+    "Larva&Adult" = n_overlap
+  ))
+
+  # labels with number + percentage (percentages below numbers)
+  total_combined <- n_larva + n_adult - n_overlap
+  labels <- c(
+    paste0(format(n_larva - n_overlap, big.mark=","), "\n(", round((n_larva - n_overlap)/total_combined*100,1), "%)"),
+    paste0(format(n_adult - n_overlap, big.mark=","), "\n(", round((n_adult - n_overlap)/total_combined*100,1), "%)"),
+    paste0(format(n_overlap, big.mark=","), "\n(", round(n_overlap/total_combined*100,1), "%)")
+  )
+
+  # plot
+  v <- plot(fit,
+       quantities = list(fontsize=12, fontface=3, labels=labels, col="black"), # numbers smaller & italic
+       fills = list(fill = c("#88C6ED", "#EF4442"), alpha = 0.6),
+       labels = list(col="black", font=2),
+       main = NULL
+  )
+
+  #  black title above diagram with less space
+  title_grob <- textGrob(taxon_name, gp=gpar(fontsize=16, fontface="bold", col="black"))
+  arranged <- arrangeGrob(title_grob, v, ncol=1, heights=c(0.06, 0.94))
+
+  return(arranged)
+}
+
+
+```
+
+Create plots
+
+```{r}
+# diagram for all taxa
+taxa_list <- unique(meta$Taxa)
+
+euler_list <- lapply(taxa_list, function(taxon) plot_taxon_euler(taxon, otu_mat, meta))
+euler_list <- euler_list[!sapply(euler_list, is.null)]
+
+# arrange in grid (3columns)
+grid.arrange_grid <- do.call(grid.arrange, c(euler_list, ncol=3, padding=unit(1.5, "lines")))
+
+
+```
+
+Save files
+
+```{r}
+
+pdf(file.path(output_dir, "Euler_Taxa.pdf"), width=12, height=12/3)
+do.call(grid.arrange, c(euler_list, ncol=3, padding=unit(1.5, "lines")))
+dev.off()
+
+
+png(file.path(output_dir, "Euler_Taxa.png"), width=3500, height=3500/3, res=300)
+do.call(grid.arrange, c(euler_list, ncol=3, padding=unit(1.5, "lines")))
+dev.off()
+
+```
+
+Include Spiders
+
+```{r}
+
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_unnorm.RData")
+
+# prep
+otu_mat <- as(otu_table(ps_final), "matrix")
+if(!taxa_are_rows(ps_final)) otu_mat <- t(otu_mat)
+
+meta <- data.frame(sample_data(ps_final)) %>%
+  filter(Lifestage %in% c("Larvae", "Adult"))  # exclude spiders here first
+
+otu_mat <- otu_mat[, rownames(meta)]
+
+# func tion
+plot_taxon_euler <- function(taxon_name, otu_mat, meta){
+
+  meta_taxon <- meta %>% filter(Taxa == taxon_name)
+
+  larva_samples <- rownames(meta_taxon[meta_taxon$Lifestage=="Larvae",])
+  adult_samples <- rownames(meta_taxon[meta_taxon$Lifestage=="Adult",])
+
+  if(length(larva_samples)==0 | length(adult_samples)==0) return(NULL)
+
+  otu_larva <- otu_mat[, larva_samples, drop=FALSE]
+  otu_adult <- otu_mat[, adult_samples, drop=FALSE]
+
+  taxa_larva <- rownames(otu_larva)[rowSums(otu_larva) > 0]
+  taxa_adult <- rownames(otu_adult)[rowSums(otu_adult) > 0]
+
+  n_larva <- length(taxa_larva)
+  n_adult <- length(taxa_adult)
+  n_overlap <- length(intersect(taxa_larva, taxa_adult))
+
+  if(n_larva == 0 & n_adult == 0) return(NULL)
+
+  # Create Euler object
+  fit <- euler(c(
+    Larva = n_larva - n_overlap,
+    Adult  = n_adult - n_overlap,
+    "Larva&Adult" = n_overlap
+  ))
+
+  # labels with number + percentage
+  total_combined <- n_larva + n_adult - n_overlap
+  labels <- c(
+    paste0(format(n_larva - n_overlap, big.mark=","), "\n(", round((n_larva - n_overlap)/total_combined*100,1), "%)"),
+    paste0(format(n_adult - n_overlap, big.mark=","), "\n(", round((n_adult - n_overlap)/total_combined*100,1), "%)"),
+    paste0(format(n_overlap, big.mark=","), "\n(", round(n_overlap/total_combined*100,1), "%)")
+  )
+
+  # plot
+  v <- plot(fit,
+       quantities = list(fontsize=12, fontface=3, labels=labels, col="black"),
+       fills = list(fill = c("#88C6ED", "#EF4442"), alpha = 0.6),
+       labels = list(col="black", font=2),
+       main = NULL
+  )
+
+  # title above diagram
+  title_grob <- textGrob(taxon_name, gp=gpar(fontsize=16, fontface="bold", col="black"))
+  arranged <- arrangeGrob(title_grob, v, ncol=1, heights=c(0.06, 0.94))
+
+  return(arranged)
+}
+
+
+taxa_list <- unique(meta$Taxa)
+euler_list <- lapply(taxa_list, function(taxon) plot_taxon_euler(taxon, otu_mat, meta))
+euler_list <- euler_list[!sapply(euler_list, is.null)]
+
+
+output_dir <- "R_output/Vertically_Transmitted_Taxa/Euler_plots"
+if(!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+pdf(file.path(output_dir, "Euler_Taxa_Larva_Adult.pdf"), width=12, height=12/3)
+do.call(grid.arrange, c(euler_list, ncol=3, padding=unit(1.5, "lines")))
+dev.off()
+
+png(file.path(output_dir, "Euler_Taxa_Larva_Adult.png"), width=3500, height=3500/3, res=300)
+do.call(grid.arrange, c(euler_list, ncol=3, padding=unit(1.5, "lines")))
+dev.off()
+
+
+meta_spider <- data.frame(sample_data(ps_final)) %>%
+  filter(Lifestage %in% c("Larvae", "Adult", "Spider"))
+otu_mat_spider <- otu_mat[, rownames(meta_spider), drop=FALSE]
+
+plot_taxon_euler3 <- function(taxon_name, otu_mat, meta){
+
+  meta_taxon <- meta %>% filter(Taxa == taxon_name)
+
+  larva_samples <- rownames(meta_taxon[meta_taxon$Lifestage=="Larvae",])
+  adult_samples <- rownames(meta_taxon[meta_taxon$Lifestage=="Adult",])
+  spider_samples <- rownames(meta_taxon[meta_taxon$Lifestage=="Spider",])
+
+  if(any(lengths(list(larva_samples, adult_samples, spider_samples)) == 0)) return(NULL)
+
+  otu_larva <- otu_mat[, larva_samples, drop=FALSE]
+  otu_adult <- otu_mat[, adult_samples, drop=FALSE]
+  otu_spider <- otu_mat[, spider_samples, drop=FALSE]
+
+  taxa_larva <- rownames(otu_larva)[rowSums(otu_larva) > 0]
+  taxa_adult <- rownames(otu_adult)[rowSums(otu_adult) > 0]
+  taxa_spider <- rownames(otu_spider)[rowSums(otu_spider) > 0]
+
+  sets <- list(
+    Larva = taxa_larva,
+    Adult = taxa_adult,
+    Spider = taxa_spider
+  )
+
+  fit <- euler(sets)
+
+  # Plot with same style
+  v <- plot(fit,
+       quantities = list(fontsize=10, fontface=3, col="black"),
+       fills = list(fill = c("#88C6ED", "#EF4442", "#22C55E"), alpha = 0.6),
+       labels = list(col="black", font=2),
+       main = NULL
+  )
+
+  title_grob <- textGrob(taxon_name, gp=gpar(fontsize=16, fontface="bold", col="black"))
+  arranged <- arrangeGrob(title_grob, v, ncol=1, heights=c(0.06, 0.94))
+
+  return(arranged)
+}
+
+# Create and save 3-group Euler diagrams
+euler_list3 <- lapply(taxa_list, function(taxon) plot_taxon_euler3(taxon, otu_mat_spider, meta_spider))
+euler_list3 <- euler_list3[!sapply(euler_list3, is.null)]
+
+pdf(file.path(output_dir, "Euler_Taxa_Larva_Adult_Spider.pdf"), width=12, height=12/3)
+do.call(grid.arrange, c(euler_list3, ncol=3, padding=unit(1.5, "lines")))
+dev.off()
+
+png(file.path(output_dir, "Euler_Taxa_Larva_Adult_Spider.png"), width=3500, height=3500/3, res=300)
+do.call(grid.arrange, c(euler_list3, ncol=3, padding=unit(1.5, "lines")))
+dev.off()
+
+```
+
+## Up vs DOWN comparison
+
+```{r}
+
+```

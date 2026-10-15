@@ -1,0 +1,1915 @@
+---
+title: "GrandRiver22:microbiome_PICRUST2 analysis"
+author: "Milena Esser"
+date: "2025-05-20"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+# Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+rm(list=ls()) 
+par(mar = c(2, 2, 2, 2)) 
+
+###Loading packages
+library(phyloseq) 
+library(ggplot2) 
+library(ggtext)
+library(dplyr) 
+library(vegan)
+library(tidyverse) 
+library(knitr) 
+library(RColorBrewer)
+library(ggpubr)
+library(picante)
+library(ggh4x) 
+library(multcompView)
+library(data.table)
+library(scales)
+
+library(maaslin3)
+
+
+#ggpicrust related:
+library(readr)
+library(ggpicrust2)
+library(tibble)
+library(tidyverse)
+library(ggprism)
+library(patchwork)
+```
+
+Information how picrust2 works and what the output is: [PICRUSt2 Tutorial (v2.1.3 beta) · picrust/picrust2 Wiki · GitHub](https://github.com/picrust/picrust2/wiki/PICRUSt2-Tutorial-(v2.1.3-beta)#picrust2-pipeline)
+
+EC_predicted.tsv = In this table the predicted copy number of all Enzyme Classification (EC) numbers is shown for each ASV
+
+EC_metagenome_out/pred_metagenome_unstrat.tsv = overall EC number abundances per sample
+
+EC_metagenome_out/pred_metagenome_strat.tsv = EC number abundances per sample stratified by the contributing ASVs.
+
+EC_metagenome_out/seqtab_norm.tsv = the ASV abundance table normalized by predicted 16S copy number
+
+EC_metagenome_out/ weighted_nsti.tsv = the mean NSTI value per sample (when taking into account the relative abundance of th eASVs). This file can be useful for identifying outlier samples in the dataset. in PICRUSt1 NSTI value \< 0.06 and \> 0.15 were suggested as good and high, respectively.
+
+Maaslin3:
+
+Different from other differential abundance tools, low prevalence features need not be filtered out since the prevalence modeling in MaAsLin 3 already accounts for high proportions of zeros. However, filtering low prevalence features might improve power.
+
+There are also a few rules of thumb to keep in mind.
+
+- Models should ideally have about 10 times as many samples (all samples for logistic fits, non-zero samples for linear fits) as covariate terms (all continuous variables plus all categorical variable levels).
+
+- Coefficients (effect sizes) larger than about 15 in absolute value are usually suspect unless very small unstandardized predictors are being included. (A coefficient of 15 corresponds to a fold change \>30000!). If you encounter such coefficients, check that (1) no error was thrown, (2) the diagnostics look reasonable, (3) a sufficient number of samples were used in fitting, (4) the q-value is significant, (5) the metadata are not highly collinear, and (6) the random effects are plausible.
+
+Maaslin3 Model Selection Strategy\
+In Maaslin3, you specify:
+
+- `fixed_effects`: variables you want to test or control for
+
+- `random_effects`: grouping variables to account for non-independence (e.g., repeated measures)
+
+Based on this, I selected site (city: WAT, KIT, CAL, HESP) as random factors. However, we only have 4 levels in site, therefore I will try and run it with small_random_effects=TRUE, as otherwise the model may be too unstable. Another alternative would be to run all as fixed levels.
+
+**Output directory**
+
+```{r}
+
+output_dir <- "R_output"  
+```
+
+## Loading the data from PICRUSt2
+
+This is based on the default MetaCyc output that picrust gives. Alternative is using KEGG database and KO abundances.
+
+Load from metagenome_out (KO)
+
+```{r}
+# load metacyc pathway
+abundance_df <- read_delim("data/newpicrust2_out_pipeline-20251218/pathways_out/path_abun_unstrat_metacyc.tsv",
+  delim = "\t", col_names = TRUE, escape_double = FALSE, trim_ws = TRUE
+)
+
+```
+
+```{r}
+
+
+library(tidyverse)
+
+metadata <- read.csv("data\\KK-Brittany-sample info sheet June2023.csv")
+
+# Replace dots with underscores
+names(metadata) <- gsub("\\.", "_", names(metadata))
+
+# Remove trailing underscores (1 or more)
+names(metadata) <- gsub("_+$", "", names(metadata))
+
+# modifying data
+metadata$Lifestage <- factor(metadata$Lifestage, levels = c("Larvae", "Adult", "Spider"),ordered = FALSE)
+
+contrasts(metadata$Lifestage) <- contr.treatment(3)
+
+
+abundance_samples <- colnames(abundance_df)[-1]   # remove "function."
+
+metadata <- metadata[metadata$Study_ID %in% abundance_samples, ]
+
+rownames(metadata) <- metadata$Study_ID
+
+# Factor assignments
+metadata$Lifestage <- factor(metadata$Lifestage)
+metadata$Taxa <- factor(metadata$Taxa)
+metadata$Location <- factor(metadata$Location)
+metadata$Site <- factor(metadata$Site)
+
+
+# Set pathway as rownames and transpose
+abundance_mat <- abundance_df %>%
+  column_to_rownames(var = "description") %>%  # pathways as rownames
+  t() %>%                                  # transpose to samples x features
+  as.data.frame()
+
+# Convert all columns to numeric after transposing
+abundance_mat <- abundance_mat %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.))))
+
+# Keep only samples present in metadata
+abundance_mat <- abundance_mat[rownames(metadata), ]
+
+
+all(rownames(abundance_mat) == rownames(metadata))
+
+output_full <- file.path(output_dir, "PICRUSt2_MaAsLin3")
+```
+
+## MAaslin3 - pathways across the whole data
+
+```{r filter-full-data}
+
+output_full <- file.path(output_dir, "PICRUSt2_MaAsLin3")
+
+# If exists, delete
+if (dir.exists(output_full)) unlink(output_full, recursive = TRUE)
+
+# Create fresh folder
+dir.create(output_full, recursive = TRUE)
+
+#--------------------------------------------------
+
+#FIlter low abundance pathways:
+keep <- colSums(abundance_mat > 0)/nrow(abundance_mat) > 0.1
+abundance_mat_filtered <- abundance_mat[, keep]
+
+
+# Total number of pathways before filtering
+total_pathways <- ncol(abundance_mat)
+
+# Number of pathways kept
+kept_pathways <- sum(keep)
+
+# Number of pathways removed
+removed_pathways <- total_pathways - kept_pathways
+
+# Percentage kept/removed
+percent_kept <- round(kept_pathways / total_pathways * 100, 1)
+percent_removed <- round(removed_pathways / total_pathways * 100, 1)
+
+cat("Total pathways:", total_pathways, "\n")
+cat("Kept pathways:", kept_pathways, "(", percent_kept, "% )\n")
+cat("Removed pathways:", removed_pathways, "(", percent_removed, "% )\n")
+
+
+
+# Store original MetaCyc pathway names
+original_pathways <- colnames(abundance_mat_filtered)
+
+# Create safe internal IDs
+safe_ids <- paste0("PATH_", seq_along(original_pathways))
+
+# Apply safe IDs
+colnames(abundance_mat_filtered) <- safe_ids
+
+# Create lookup table
+pathway_key <- data.frame(
+  Safe_ID = safe_ids,
+  MetaCyc_Pathway = original_pathways,
+  stringsAsFactors = FALSE
+)
+
+# Save the key so nothing is ever lost
+write.csv(pathway_key,
+          file.path(output_full, "Pathway_Name_Key.csv"),
+          row.names = FALSE)
+
+```
+
+### Run full community model
+
+```{r, eval=FALSE}
+fit <- maaslin3(
+  input_data = abundance_mat_filtered,
+  input_metadata = metadata,
+  output = output_full,
+  fixed_effects = c("Location", "Taxa", "Lifestage"),  # fixed effects
+  random_effects = c("Site"),                           # random effect
+  normalization = "TSS",    # total sum scaling
+  transform = "LOG",        # log transform abundance
+  standardize = TRUE,
+  small_random_effects = TRUE,
+  max_significance = 0.05         # 0.1 optional for exploratory analysis
+)
+
+```
+
+### Run full model on macroinvertebrates only (as am getting the rank deficient error by maaslin)
+
+```{r}
+
+output_macro <- file.path(output_dir, "PICRUSt2_MaAsLin3_macroinv")
+if (dir.exists(output_macro)) unlink(output_macro, recursive = TRUE)
+dir.create(output_macro, recursive = TRUE)
+
+#--------------------------------------------------
+
+metadata_no_spiders <- metadata %>%
+  dplyr::filter(Lifestage != "Spider") %>%
+  droplevels()
+
+samples_keep <- rownames(metadata_no_spiders)
+
+abundance_no_spiders <- abundance_mat_filtered[samples_keep, ]
+
+
+fit <- maaslin3(
+  input_data = abundance_no_spiders,
+  input_metadata = metadata_no_spiders,
+  output = output_macro,
+  fixed_effects = c("Location", "Taxa", "Lifestage"),  # fixed effects
+  random_effects = c("Site"),                           # random effect
+  normalization = "TSS",    # total sum scaling
+  transform = "LOG",        # log transform abundance
+  standardize = TRUE,
+  small_random_effects = TRUE,
+  max_significance = 0.05,         # 0.1 optional for exploratory analysis
+  median_comparison_abundance = TRUE)
+```
+
+##### Summary table
+
+```{r}
+library(tidyverse)
+
+# File
+results_file <- file.path(output_macro, "all_results.tsv")
+
+# Read in results
+maaslin_results <- read_tsv(results_file, show_col_types = FALSE)
+
+# Restore original pathway names
+pathway_key <- read.csv(file.path(output_full, "Pathway_Name_Key.csv"))
+
+maaslin_results <- maaslin_results %>%
+  left_join(pathway_key, by = c("feature" = "Safe_ID"))
+
+head(maaslin_results)
+
+
+# Define significance threshold
+qval_cutoff <- 0.05
+
+sig_results <- maaslin_results %>%
+  filter(qval_joint <= qval_cutoff)
+
+# Check how many significant hits
+nrow(sig_results)
+head(sig_results)
+
+# Significant results only
+write.csv(sig_results,
+          file.path(output_macro, "MaAsLin_significant_results_q0.05.csv"),
+          row.names = FALSE)
+```
+
+##### Plot Association plots
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+
+min_effect <- 0.75   # minimum absolute MaAsLin coefficient to plot
+alpha_sig  <- 0.05   # q-value threshold
+
+#Filter sig results
+sig_results_filtered <- sig_results %>%
+  filter(
+    qval_joint <= alpha_sig,
+    is.na(error),
+    abs(coef) >= min_effect
+  )
+
+
+# aAbundance matrix → TSS + log2 + median centering + SD
+
+abundance_mat <- abundance_no_spiders  # or abundance_spiders
+
+# TSS normalization
+abundance_tss <- sweep(abundance_mat, 1, rowSums(abundance_mat), FUN = "/")
+
+# Log2 transform with pseudo-count
+abundance_log <- log2(abundance_tss + 1e-5)
+
+
+# long foramt and metadata
+abundance_long <- abundance_log %>%
+  rownames_to_column("Sample_ID") %>%
+  pivot_longer(
+    cols = -Sample_ID,
+    names_to = "feature",
+    values_to = "abundance"
+  ) %>%
+  left_join(metadata, by = c("Sample_ID" = "Study_ID")) %>%
+  mutate(
+    Lifestage = factor(Lifestage, levels = c("Larvae", "Adult", "Spider")),
+    Taxa     = factor(Taxa, levels = c("Chironomidae", "Hydropsychidae", "Heptageniidae",
+                                      "Tetragnatha", "Araneid")),
+    Location = factor(Location, levels = c("UP", "DWN"))
+  )
+
+#helper function
+make_safe_filename <- function(x) {
+  x %>% gsub(" ", "_", .) %>% gsub("/", "_", .) %>% gsub(":", "_", .)
+}
+
+q_to_stars <- function(q) {
+  case_when(
+    q <= 0.001 ~ "***",
+    q <= 0.01  ~ "**",
+    q <= 0.05  ~ "*",
+    TRUE       ~ ""
+  )
+}
+
+#output folder
+plot_base <- file.path(output_macro, "Association_Plots_all")
+if (dir.exists(plot_base)) unlink(plot_base, recursive = TRUE, force = TRUE)
+dir.create(plot_base, recursive = TRUE, showWarnings = FALSE)
+
+#group results
+grouped_results <- sig_results_filtered %>%
+  group_by(feature, metadata, model) %>%
+  group_split()
+
+#plotting loop
+for (grp in grouped_results) {
+
+  pathway    <- unique(grp$feature)
+  factor_nm  <- unique(grp$metadata)
+  model_type <- unique(grp$model)
+  pathway_nm <- unique(grp$MetaCyc_Pathway)
+
+  df_plot <- abundance_long %>% filter(feature == pathway)
+  if (nrow(df_plot) == 0) next
+
+  safe_name <- make_safe_filename(pathway_nm)
+  ref_level <- levels(df_plot[[factor_nm]])[1]
+
+  linear_dir   <- file.path(plot_base, factor_nm, "Linear")
+  logistic_dir <- file.path(plot_base, factor_nm, "Logistic")
+  dir.create(linear_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(logistic_dir, recursive = TRUE, showWarnings = FALSE)
+
+  #------------------------------------
+  # Add (n=) counts to x-axis labels
+  n_per_level <- df_plot %>%
+    group_by(.data[[factor_nm]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")"))
+
+  df_plot <- df_plot %>%
+    left_join(n_per_level, by = setNames(factor_nm, factor_nm))
+
+  # Ensure label_x is a factor in the right order
+df_plot <- df_plot %>%
+  mutate(
+    label_x = factor(label_x, levels = n_per_level %>%
+                                       mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")")) %>%
+                                       pull(label_x))
+  )
+  
+  # Linear  model
+  if (model_type == "abundance") {
+
+  # Compute counts per factor level for (n=)
+  n_per_level <- df_plot %>%
+    group_by(.data[[factor_nm]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")"))
+
+  
+  # Prepare significance annotations
+  # Calculate max per group
+# Calculate top per group and add proportional offset
+y_positions <- df_plot %>%
+  group_by(.data[[factor_nm]]) %>%
+  summarise(y_max = max(abundance, na.rm = TRUE), .groups = "drop") %>%
+  left_join(n_per_level, by = setNames(factor_nm, factor_nm)) %>%
+  mutate(
+    y_pos = y_max + 2   # adjust spacing if needed
+  )
+
+sig_annot <- grp %>%
+  filter(value != ref_level) %>%
+  mutate(
+    stars = q_to_stars(qval_joint),
+    label = paste0(stars, "\ncoef = ", round(coef, 2))
+  ) %>%
+  left_join(y_positions, by = c("value" = factor_nm)) %>%
+  mutate(value = label_x)
+
+ # add the q-value for subtitle (take first or min)
+  fdr_value <- signif(min(grp$qval_joint, na.rm = TRUE), 3)  # e.g., 1.23e-8
+
+
+  # Add a column to use the pathway name as y-axis label
+  df_plot <- df_plot %>%
+    mutate(pathway_label = pathway_nm)
+
+  p <- ggplot(df_plot, aes(x = label_x, y = abundance, fill = .data[[factor_nm]])) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.6) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 1) +
+  geom_text(
+  data = sig_annot,
+  aes(x = value, y = y_pos, label = label),
+  inherit.aes = FALSE,
+  size = 3.5,
+  vjust = 1   # anchors text "on" the y_pos
+) +
+  scale_fill_brewer(palette = "Set2") +
+ # scale_y_reverse() +   #  reverse y-axis
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  ) +
+  labs(
+    title = pathway_nm,   # keep title as before
+    subtitle = paste(" |coef| ≥", min_effect, " | FDR = ", fdr_value),
+    x = factor_nm,
+    y = "Log2(rel. abundance + 1e-5)"
+  )
+  
+  ggsave(
+    filename = paste0("Association_", safe_name, ".png"),
+    plot = p,
+    path = linear_dir,
+    width = 6,
+    height = 4.5,
+    dpi = 300
+  )
+}
+########################################################|
+# Prevalence model plotting
+
+if (model_type %in% c("prevalence", "logistic")) {
+
+  # Convert abundance to presence/absence
+  df_prev <- df_plot %>%
+    mutate(
+      presence = ifelse(abundance > 0, 1, 0)  # 1 = Present, 0 = Absent
+    )
+
+  # Compute prevalence per factor level
+  prevalence_df <- df_prev %>%
+    group_by(.data[[factor_nm]]) %>%
+    summarize(prevalence = mean(presence), .groups = "drop")
+
+  # Prepare significance annotations
+  sig_annot <- grp %>%
+    filter(value != ref_level) %>%
+    mutate(
+      stars = q_to_stars(qval_joint),
+      label = paste0(stars, "\ncoef = ", round(coef, 2))
+    ) %>%
+    left_join(n_per_level, by = c("value" = factor_nm)) %>%
+    mutate(value = label_x)
+
+  # Plot
+  p <- ggplot(prevalence_df, aes(x = .data[[factor_nm]], y = prevalence)) +
+    geom_col(fill = "#66C2A5", color = "black", width = 0.6) +
+    # Optional: overlay jittered points for individual samples
+    geom_jitter(data = df_prev, aes(x = .data[[factor_nm]], y = presence),
+                width = 0.2, height = 0.02, size = 1.5, alpha = 0.6, color = "darkblue") +
+    # Add significance annotations
+    geom_text(data = sig_annot, aes(x = value, y = 1.05, label = label),
+              inherit.aes = FALSE, size = 3.5, vjust = 0) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1.15)) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    labs(
+      title = pathway_nm,
+      subtitle = paste("Prevalence model | Median-centered test | |coef| ≥", min_effect),
+      x = factor_nm,
+      y = "Proportion present"
+    )
+
+  # Save the plot
+  ggsave(
+    filename = paste0("Association_", safe_name, ".png"),
+    plot = p,
+    path = logistic_dir,
+    width = 6, height = 4.5, dpi = 300
+  )
+}
+
+
+}
+
+```
+
+##### Create summary table for top associations
+
+“Top associations” = **The N associations with the largest combined biological and statistical evidence** *within a given metadata variable and model.“Top associations were ranked using a composite score combining absolute effect size and false discovery rate (\|β\| × −log10(FDR)).”*
+
+```{r}
+
+#  Summary of results with relative abundances for all levels
+
+#select number of top associations
+top_asso_nbr=20
+
+
+
+# First, identify all metadata factors tested
+tested_metadata <- unique(sig_results_filtered$metadata)
+
+# Create an empty list to store top associations per metadata and model
+top_assoc_list <- list()
+
+for (meta in tested_metadata) {
+  
+  for (mod in c("abundance", "prevalence")) {
+    
+    # Subset significant results for this metadata and model
+    sig_meta <- sig_results_filtered %>%
+  filter(metadata == meta, model == mod) %>%
+  mutate(
+    abs_coef = abs(coef),
+    rank_score = abs(coef) * -log10(qval_joint)
+  )
+    
+    if(nrow(sig_meta) == 0) next  # skip if none
+    
+    # Get top 20 strongest associations by absolute coefficient
+    top_meta <- sig_meta %>%
+      slice_max(order_by = rank_score, n = top_asso_nbr, with_ties = FALSE) %>%
+      ungroup() %>%
+      arrange(desc(abs_coef))
+    
+    # Compute mean relative abundance for each level of this metadata
+    abundance_means <- abundance_long %>%
+      filter(feature %in% top_meta$feature) %>%
+      group_by(feature, meta_level = .data[[meta]]) %>%
+      summarise(mean_abundance = mean(abundance, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = meta_level, values_from = mean_abundance)
+    
+    # Join abundances with top_meta
+    top_meta_with_abund <- top_meta %>%
+      left_join(abundance_means, by = "feature") %>%
+      mutate(model = mod)
+    
+    top_assoc_list[[paste(meta, mod, sep = "_")]] <- top_meta_with_abund
+  }
+}
+
+# Combine all metadata and model summaries
+top_assoc_all <- bind_rows(top_assoc_list)
+
+
+file_name <- paste0("Top", top_asso_nbr, "_strongest_associations_by_model.csv")
+
+# Save CSV directly inside plot_base
+write.csv(
+  top_assoc_all,
+  file.path(plot_base, file_name),
+  row.names = FALSE
+)
+
+
+# Preview in console
+message_txt <- paste0(
+  "=== Top ", top_asso_nbr, 
+  " strongest associations per metadata and model with mean relative abundances per factor level ==="
+)
+
+print(message_txt)
+print(top_assoc_all)
+```
+
+##### Plot compare Up vs down
+
+```{r}
+library(tidyverse)
+
+# Filter for Location metadata and abundance model
+top_location <- top_assoc_all %>%
+  filter(metadata == "Location", model == "abundance") %>%
+  slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+  arrange(desc(abs_coef)) %>%
+  mutate(feature = factor(MetaCyc_Pathway, levels = MetaCyc_Pathway),
+         direction = ifelse(coef > 0, "UP", "DWN"))
+
+# Pivot only existing columns for mean abundance
+abund_cols <- intersect(c("UP", "DWN"), colnames(top_location))
+
+abund_long <- top_location %>%
+  pivot_longer(cols = all_of(abund_cols), names_to = "Location_level", values_to = "mean_abundance")
+
+# Plot
+p<-ggplot(top_location, aes(x = feature, y = coef, fill = direction)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("UP" = "#1f78b4", "DWN" = "#e31a1c")) +
+  labs(
+    x = "Pathway",
+    y = "Effect size (coef)",
+    fill = "Location"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+p
+
+
+ # Save the plot
+  ggsave(
+    filename = paste0("DAA_sum_plot_top", top_asso_nbr,"_UPvsDWN_macroinv.png"),
+    plot = p,
+    path = output_macro,
+    width = 9, height = 4.5, dpi = 300)
+```
+
+##### DAA_summary plot compare larvae vs adult
+
+```{r}
+library(tidyverse)
+
+# Filter for Location metadata and abundance model
+top_life <- top_assoc_all %>%
+  filter(metadata == "Lifestage", model == "abundance") %>%
+  slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+  arrange(desc(abs_coef)) %>%
+  mutate(feature = factor(MetaCyc_Pathway, levels = MetaCyc_Pathway),
+         direction = ifelse(coef > 0, "Adult", "Larvae"))
+
+# Pivot only existing columns for mean abundance
+abund_cols <- intersect(c("Adult", "Larvae"), colnames(top_life))
+
+abund_long <- top_life %>%
+  pivot_longer(cols = all_of(abund_cols), names_to = "Location_level", values_to = "mean_abundance")
+
+# Plot
+p<-ggplot(top_life, aes(x = feature, y = coef, fill = direction)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Adult" = "#1f78b4", "Larvae" = "#e31a1c")) +
+  labs(
+#    title = "Top 10 microbial pathways differing between Adult and Larvae",
+ #   subtitle = "Coefficient indicates enrichment direction (positive = Adult, negative = Larvae)",
+    x = "Pathway",
+    y = "Effect size (coef)",
+    fill = "Lifestage"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+p
+
+ # Save the plot
+  ggsave(
+    filename = paste0("DAA_sum_plot_", top_asso_nbr,"_AdultvsLarvae_macroinv.png"),
+    plot = p,
+    path = output_macro,
+    width = 9, height = 4.5, dpi = 300)
+```
+
+### Run full model on Spiders only
+
+```{r}
+output_spider <- file.path(output_dir, "PICRUSt2_MaAsLin3_spider")
+
+if (dir.exists(output_spider)) unlink(output_spider, recursive = TRUE)
+dir.create(output_spider, recursive = TRUE)
+
+#--------------------------------------------------
+
+
+
+metadata_spiders <- metadata %>%
+  dplyr::filter(Lifestage == "Spider") %>%
+  droplevels()
+
+samples_keep <- rownames(metadata_spiders)
+
+abundance_spiders <- abundance_mat_filtered[samples_keep, ]
+
+
+fit <- maaslin3(
+  input_data = abundance_spiders,
+  input_metadata = metadata_spiders,
+  output = output_spider,
+  fixed_effects = c("Location", "Taxa"),  # fixed effects
+  random_effects = c("Site"),                           # random effect
+  normalization = "TSS",    # total sum scaling
+  transform = "LOG",        # log transform abundance
+  standardize = TRUE,
+  small_random_effects = TRUE,
+  max_significance = 0.05         # 0.1 optional for exploratory analysis
+)
+
+
+```
+
+##### Summary table
+
+```{r}
+
+# File
+results_file <- file.path(output_spider, "all_results.tsv")
+
+# Read in results
+maaslin_results <- read_tsv(results_file, show_col_types = FALSE)
+
+# Restore original pathway names
+pathway_key <- read.csv(file.path(output_full, "Pathway_Name_Key.csv"))
+
+maaslin_results <- maaslin_results %>%
+  left_join(pathway_key, by = c("feature" = "Safe_ID"))
+
+# Quick look
+head(maaslin_results)
+
+
+# Define significance threshold
+qval_cutoff <- 0.05
+
+sig_results <- maaslin_results %>%
+  filter(qval_joint <= qval_cutoff)
+
+# Check how many significant hits
+nrow(sig_results)
+head(sig_results)
+
+# Significant results only
+write.csv(sig_results,
+          file.path(output_spider, "MaAsLin_spiders_significant_results_q0.05.csv"),
+          row.names = FALSE)
+
+
+```
+
+##### Plot Association plots
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+
+
+#interpretation coeff
+# ≥ 0.5 | moderate | conservative |
+# ≥ 0.75 | strong | very clean |
+# ≥ 1.0 | very strong | headline-only |
+
+min_effect <- 0.75   # minimum absolute MaAsLin coefficient to plot
+alpha_sig  <- 0.05
+
+# Filter significant MaAsLin results
+sig_results_filtered <- sig_results %>%
+  filter(
+    qval_joint <= alpha_sig,
+    is.na(error),
+    abs(coef) >= min_effect
+  )
+
+# Abundance matrix → TSS + log2 + median centering + SD
+
+
+# TSS normalization
+abundance_tss <- sweep(abundance_spiders, 1, rowSums(abundance_spiders), FUN = "/")
+
+# Log2 transform with pseudo-count
+abundance_log <- log2(abundance_tss + 1e-5)
+
+
+abundance_long <- abundance_log %>%
+  rownames_to_column("Sample_ID") %>%
+  pivot_longer(
+    cols = -Sample_ID,
+    names_to = "feature",
+    values_to = "abundance"
+  ) %>%
+  left_join(metadata, by = c("Sample_ID" = "Study_ID")) %>%
+  # Keep only the spider taxa
+  filter(Taxa %in% c("Tetragnatha", "Araneid")) %>%
+  mutate(
+    Taxa = factor(
+      Taxa,
+      levels = c("Tetragnatha", "Araneid")
+    ),
+    Location = factor(Location, levels = c("UP", "DWN"))
+  )
+#helper function
+make_safe_filename <- function(x) {
+  x %>%
+    gsub(" ", "_", .) %>%
+    gsub("/", "_", .) %>%
+    gsub(":", "_", .)
+}
+
+q_to_stars <- function(q) {
+  case_when(
+    q <= 0.001 ~ "***",
+    q <= 0.01  ~ "**",
+    q <= 0.05  ~ "*",
+    TRUE       ~ ""
+  )
+}
+
+
+
+plot_base <- file.path(output_spider, "Association_Plots_all")
+# Remove folder if it exists (overwrite)
+if (dir.exists(plot_base)) {
+  unlink(plot_base, recursive = TRUE, force = TRUE)
+}
+
+# Then recreate
+dir.create(plot_base, recursive = TRUE, showWarnings = FALSE)
+
+#group maaslin results
+grouped_results <- sig_results_filtered %>%
+  group_by(feature, metadata, model) %>%
+  group_split()
+
+#plot loop
+for (grp in grouped_results) {
+
+  pathway    <- unique(grp$feature)
+  factor_nm  <- unique(grp$metadata)
+  model_type <- unique(grp$model)
+  pathway_nm <- unique(grp$MetaCyc_Pathway)
+
+  df_plot <- abundance_long %>% filter(feature == pathway)
+
+  if (nrow(df_plot) == 0) next
+
+  safe_name <- make_safe_filename(pathway_nm)
+
+  ref_level <- levels(df_plot[[factor_nm]])[1]
+
+  linear_dir   <- file.path(plot_base, factor_nm, "Linear")
+  logistic_dir <- file.path(plot_base, factor_nm, "Logistic")
+
+  dir.create(linear_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(logistic_dir, recursive = TRUE, showWarnings = FALSE)
+ 
+  
+  #------------------------------------
+  # Add (n=) counts to x-axis labels
+  n_per_level <- df_plot %>%
+    group_by(.data[[factor_nm]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")"))
+  
+  df_plot <- df_plot %>%
+    left_join(n_per_level, by = setNames(factor_nm, factor_nm))
+  
+  # Ensure label_x is a factor in the right order
+  df_plot <- df_plot %>%
+    mutate(
+      label_x = factor(label_x, levels = n_per_level %>%
+                         mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")")) %>%
+                         pull(label_x))
+    )
+  
+  #Abundace linear model
+   if (model_type == "abundance") {
+    
+    # Compute counts per factor level for (n=)
+    n_per_level <- df_plot %>%
+      group_by(.data[[factor_nm]]) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")"))
+    
+    
+    # Prepare significance annotations
+    # Calculate max per group
+    # Calculate top per group and add proportional offset
+    y_positions <- df_plot %>%
+      group_by(.data[[factor_nm]]) %>%
+      summarise(y_max = max(abundance, na.rm = TRUE), .groups = "drop") %>%
+      left_join(n_per_level, by = setNames(factor_nm, factor_nm)) %>%
+      mutate(
+        y_pos = y_max + 2   # adjust spacing if needed
+      )
+    
+    sig_annot <- grp %>%
+      filter(value != ref_level) %>%
+      mutate(
+        stars = q_to_stars(qval_joint),
+        label = paste0(stars, "\ncoef = ", round(coef, 2))
+      ) %>%
+      left_join(y_positions, by = c("value" = factor_nm)) %>%
+      mutate(value = label_x)
+    
+    # add the q-value for subtitle (take first or min)
+    fdr_value <- signif(min(grp$qval_joint, na.rm = TRUE), 3)  # e.g., 1.23e-8
+    
+    
+    # Add a column to use the pathway name as y-axis label
+    df_plot <- df_plot %>%
+      mutate(pathway_label = pathway_nm)
+    
+    p <- ggplot(df_plot, aes(x = label_x, y = abundance, fill = .data[[factor_nm]])) +
+      geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.6) +
+      geom_jitter(width = 0.2, alpha = 0.6, size = 1) +
+      geom_text(
+        data = sig_annot,
+        aes(x = value, y = y_pos, label = label),
+        inherit.aes = FALSE,
+        size = 3.5,
+        vjust = 1   # anchors text "on" the y_pos
+      ) +
+      scale_fill_brewer(palette = "Set2") +
+      # scale_y_reverse() +   # <-- reverse y-axis
+      theme_bw(base_size = 12) +
+      theme(
+        legend.position = "none",
+        plot.title = element_text(face = "bold")
+      ) +
+      labs(
+        title = pathway_nm,   # keep title as before
+        subtitle = paste(" |coef| ≥", min_effect, " | FDR = ", fdr_value),
+        x = factor_nm,
+        y = "Log2(rel. abundance + 1e-5)"
+      )
+    
+    
+    ggsave(
+      filename = paste0("Association_", safe_name, ".png"),
+      plot = p,
+      path = linear_dir,
+      width = 6,
+      height = 4.5,
+      dpi = 300
+    )
+  }
+
+  #Prevalence ( logistic model)
+  if (model_type %in% c("prevalence", "logistic")) {
+
+    outdir <- logistic_dir
+
+    df_prev <- df_plot %>%
+      mutate(
+        presence = factor(
+          ifelse(abundance > 0, "Present", "Absent"),
+          levels = c("Absent", "Present")
+        )
+      )
+
+    sig_annot <- grp %>%
+      filter(value != ref_level) %>%
+      mutate(
+        stars = q_to_stars(qval_joint),
+        label = paste0(
+          stars,
+          "\ncoef = ", round(coef, 2)
+        )
+      )
+
+    p <- ggplot(
+      df_prev,
+      aes(
+        x = .data[[factor_nm]],
+        y = presence,
+        fill = .data[[factor_nm]]
+      )
+    ) +
+      geom_boxplot(
+        alpha = 0.7,
+        outlier.shape = NA,
+        width = 0.6
+      ) +
+      geom_jitter(
+        aes(color = .data[[factor_nm]]),
+        height = 0.15,
+        width = 0.2,
+        size = 1,
+        alpha = 0.6,
+        show.legend = FALSE
+      ) +
+      scale_fill_brewer(palette = "Set2") +
+      scale_color_brewer(palette = "Set2") +
+      theme_bw(base_size = 12) +
+      theme(
+        legend.position = "none",
+        plot.title = element_text(face = "bold")
+      ) +
+      labs(
+        title = pathway_nm,
+        subtitle = paste(
+          "Prevalence model | Median-centered test | |coef| ≥",
+          min_effect
+        ),
+        x = factor_nm,
+        y = "Feature state"
+      )
+
+    ggsave(
+      filename = paste0("Association_", safe_name, ".png"),
+      plot = p,
+      path = outdir,
+      width = 6,
+      height = 4.5,
+      dpi = 300
+    )
+  }
+  
+}
+
+
+```
+
+##### Create summary table for top associations
+
+```{r}
+# Summary of results with relative abundances for all levels
+
+#select number of top associations
+top_asso_nbr=20
+
+
+# First, identify all metadata factors tested
+tested_metadata <- unique(sig_results_filtered$metadata)
+
+# Create an empty list to store top associations per metadata and model
+top_assoc_list <- list()
+
+for (meta in tested_metadata) {
+  
+  for (mod in c("abundance", "prevalence")) {
+    
+    # Subset significant results for this metadata and model
+    sig_meta <- sig_results_filtered %>%
+      filter(metadata == meta, model == mod) %>%
+      mutate(abs_coef = abs(coef))
+    
+    if(nrow(sig_meta) == 0) next  # skip if none
+    
+    # Get top 20 strongest associations by absolute coefficient
+    top_meta <- sig_meta %>%
+      slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+      ungroup() %>%
+      arrange(desc(abs_coef))
+    
+    # Compute mean relative abundance for each level of this metadata
+    abundance_means <- abundance_long %>%
+      filter(feature %in% top_meta$feature) %>%
+      group_by(feature, meta_level = .data[[meta]]) %>%
+      summarise(mean_abundance = mean(abundance, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = meta_level, values_from = mean_abundance)
+    
+    # Join abundances with top_meta
+    top_meta_with_abund <- top_meta %>%
+      left_join(abundance_means, by = "feature") %>%
+      mutate(model = mod)
+    
+    top_assoc_list[[paste(meta, mod, sep = "_")]] <- top_meta_with_abund
+  }
+}
+
+# Combine all metadata and model summaries
+top_assoc_all <- bind_rows(top_assoc_list)
+
+# Construct filename directly
+file_name <- paste0("Top", top_asso_nbr, "_strongest_associations_by_model.csv")
+
+# Save CSV directly inside plot_base
+write.csv(
+  top_assoc_all,
+  file.path(plot_base, file_name),
+  row.names = FALSE
+)
+
+
+# Preview in console
+message_txt <- paste0(
+  "=== Top ", top_asso_nbr, 
+  " strongest associations per metadata and model with mean relative abundances per factor level ==="
+)
+
+print(message_txt)
+print(top_assoc_all)
+```
+
+##### DAA_summary plot compare Up vs downstream in spiders
+
+```{r}
+library(tidyverse)
+
+# Filter for Location metadata and abundance model
+top_location <- top_assoc_all %>%
+  filter(metadata == "Location", model == "abundance") %>%
+  slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+  arrange(desc(abs_coef)) %>%
+  mutate(feature = factor(MetaCyc_Pathway, levels = MetaCyc_Pathway),
+         direction = ifelse(coef > 0, "UP", "DWN"))
+
+# Pivot only existing columns for mean abundance
+abund_cols <- intersect(c("UP", "DWN"), colnames(top_location))
+
+abund_long <- top_location %>%
+  pivot_longer(cols = all_of(abund_cols), names_to = "Location_level", values_to = "mean_abundance")
+
+# Plot
+p<-ggplot(top_location, aes(x = feature, y = coef, fill = direction)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("UP" = "#1f78b4", "DWN" = "#e31a1c")) +
+  labs(
+    x = "Pathway",
+    y = "Effect size (coef)",
+    fill = "Location"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+p
+
+
+ # Save the plot
+  ggsave(
+    filename = paste0("DAA_sum_plot_top", top_asso_nbr,"_UPvsDWN_macroinv.png"),
+    plot = p,
+    path = output_spider,
+    width = 9, height = 4.5, dpi = 300)
+```
+
+##### DAA_summary plot compare taxa spiders
+
+```{r}
+
+# Filter for Location metadata and abundance model
+top_taxa <- top_assoc_all %>%
+  filter(metadata == "Taxa", model == "abundance") %>%
+  slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+  arrange(desc(abs_coef)) %>%
+  mutate(feature = factor(MetaCyc_Pathway, levels = MetaCyc_Pathway),
+         direction = ifelse(coef > 0, "Tetragnatha", "Araneidae"))
+
+# Pivot only existing columns for mean abundance
+abund_cols <- intersect(c("Tetragnatha", "Araneidae"), colnames(top_taxa))
+
+abund_long <- top_taxa %>%
+  pivot_longer(cols = all_of(abund_cols), names_to = "Location_level", values_to = "mean_abundance")
+
+# Plot
+p<-ggplot(top_taxa, aes(x = feature, y = coef, fill = direction)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Tetragnatha" = "#1f78b4", "Araneidae" = "#e31a1c")) +
+  labs(
+    x = "Pathway",
+    y = "Effect size (coef)",
+    fill = "Taxon"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+p
+
+
+ # Save the plot
+  ggsave(
+    filename = paste0("DAA_sum_plot_top", top_asso_nbr,"_TetravsAran_spiders.png"),
+    plot = p,
+    path = output_spider,
+    width = 9, height = 4.5, dpi = 300)
+```
+
+## MAsLin3 - pathways by taxon
+
+```{r}
+
+taxa_list <- unique(metadata$Taxa)
+
+min_effect <- 0.75   # minimum absolute MaAsLin coefficient to plot
+alpha_sig  <- 0.05   # q-value threshold
+
+
+
+#select number of top associations
+top_asso_nbr=20
+
+output_base <- file.path(output_dir, "PICRUSt2_MaAsLin3_by_taxon")
+
+# Remove the existing output folder if it exists
+if (dir.exists(output_base)) {
+    message("Cleaning output directory: ", output_base)
+    success <- unlink(output_base, recursive = TRUE, force = TRUE)
+    if (success == 0) {
+      message("Successfully removed: ", output_base)
+    } else {
+      warning("Failed to remove: ", output_base)
+    }
+}
+
+# Recreate the output folder cleanly
+dir.create(output_base, recursive = TRUE, showWarnings = FALSE)
+message("Output directory created: ", output_base)
+
+
+# Loop over each taxon
+for (taxon in unique(metadata$Taxa)) {
+  message("Processing: ", taxon)
+
+  # Subset metadata
+  meta_sub <- subset(metadata, Taxa == taxon)
+  
+  # Convert fixed effects to factors
+meta_sub$Site <- factor(meta_sub$Site)
+meta_sub$Location <- factor(meta_sub$Location)
+meta_sub$Lifestage <- factor(meta_sub$Lifestage)
+  
+  # Skip if too few samples
+  if (nrow(meta_sub) < 10) {
+    message("  Skipping (too few samples)")
+    next
+  }
+
+  # Skip if not both life stages
+  if (length(unique(meta_sub$Lifestage)) < 2) {
+    message("  Skipping (not both life stages)")
+    next
+  }
+
+
+ # Subset pathway table
+  abundance_mat_sub <- abundance_mat_filtered[rownames(meta_sub), , drop = FALSE]
+
+#FIlter low abundance pathways:
+keep <- colSums(abundance_mat_sub > 0)/nrow(abundance_mat_sub) > 0.1
+abundance_mat_sub_filtered <- abundance_mat_sub[, keep]
+
+
+# Total number of pathways before filtering
+total_pathways <- ncol(abundance_mat_sub)
+
+# Number of pathways kept
+kept_pathways <- sum(keep)
+
+# Number of pathways removed
+removed_pathways <- total_pathways - kept_pathways
+
+# Percentage kept/removed
+percent_kept <- round(kept_pathways / total_pathways * 100, 1)
+percent_removed <- round(removed_pathways / total_pathways * 100, 1)
+
+cat("Total pathways:", total_pathways, "\n")
+cat("Kept pathways:", kept_pathways, "(", percent_kept, "% )\n")
+cat("Removed pathways:", removed_pathways, "(", percent_removed, "% )\n")
+
+
+
+  # Define output directory for taxon
+  output_dir_tax <- file.path(output_base, paste0("Taxon_", gsub("[^A-Za-z0-9]", "_", taxon)))
+  dir.create(output_dir_tax, recursive = TRUE, showWarnings = FALSE)
+
+  # Run MaAsLin3
+ fit <- maaslin3(
+  input_data = abundance_mat_sub_filtered,
+  input_metadata = meta_sub,
+  output = output_dir_tax,
+  fixed_effects = c("Location", "Lifestage"),  # fixed effects
+  random_effects = c("Site"),                           # random effect
+  normalization = "TSS",    # total sum scaling
+  transform = "LOG",        # log transform abundance
+  standardize = TRUE,
+  small_random_effects = TRUE,
+  max_significance = 0.05         # optional for exploratory analysis
+)
+
+######################################################
+ 
+ #SUMMARY TABLE
+ 
+#######################################################
+ 
+ # File
+results_file <- file.path(output_dir_tax, "all_results.tsv")
+
+# Read in results
+maaslin_results <- read_tsv(results_file, show_col_types = FALSE)
+
+# Restore original pathway names
+pathway_key <- read.csv(file.path(output_full, "Pathway_Name_Key.csv"))
+
+maaslin_results <- maaslin_results %>%
+  left_join(pathway_key, by = c("feature" = "Safe_ID"))
+
+# Quick look
+head(maaslin_results)
+
+
+# Define significance threshold
+qval_cutoff <- 0.05
+
+sig_results <- maaslin_results %>%
+  filter(qval_joint <= qval_cutoff)
+
+# Check how many significant hits
+nrow(sig_results)
+head(sig_results)
+
+# Significant results only
+write.csv(sig_results,
+          file.path(output_dir_tax, "MaAsLin_spiders_significant_results_q0.05.csv"),
+          row.names = FALSE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Filter significant MaAsLin results
+
+sig_results_filtered <- sig_results %>%
+  filter(
+    qval_joint <= alpha_sig,
+    is.na(error),
+    abs(coef) >= min_effect
+  )
+
+
+ abundance_mat_sub_filtered  # or abundance_spiders
+
+# TSS normalization
+abundance_tss <- sweep(abundance_mat_sub_filtered, 1, rowSums(abundance_mat_sub_filtered), FUN = "/")
+
+# Log2 transform with pseudo-count
+abundance_log <- log2(abundance_tss + 1e-5)
+
+
+# abundance elong format and metadata
+abundance_long <- abundance_log %>%
+  rownames_to_column("Sample_ID") %>%
+  pivot_longer(
+    cols = -Sample_ID,
+    names_to = "feature",
+    values_to = "abundance"
+  ) %>%
+  left_join(metadata, by = c("Sample_ID" = "Study_ID")) %>%
+  mutate(
+    Lifestage = factor(Lifestage, levels = c("Larvae", "Adult", "Spider")),
+    Taxa     = factor(Taxa, levels = c("Chironomidae", "Hydropsychidae", "Heptageniidae",
+                                      "Tetragnatha", "Araneid")),
+    Location = factor(Location, levels = c("UP", "DWN"))
+  )
+
+# helper function
+make_safe_filename <- function(x) {
+  x %>% gsub(" ", "_", .) %>% gsub("/", "_", .) %>% gsub(":", "_", .)
+}
+
+q_to_stars <- function(q) {
+  case_when(
+    q <= 0.001 ~ "***",
+    q <= 0.01  ~ "**",
+    q <= 0.05  ~ "*",
+    TRUE       ~ ""
+  )
+}
+
+#output-
+plot_base <- file.path(output_dir_tax, "Association_Plots_all")
+if (dir.exists(plot_base)) unlink(plot_base, recursive = TRUE, force = TRUE)
+dir.create(plot_base, recursive = TRUE, showWarnings = FALSE)
+
+#group maaslin results
+grouped_results <- sig_results_filtered %>%
+  group_by(feature, metadata, model) %>%
+  group_split()
+
+# plot loop
+for (grp in grouped_results) {
+
+  pathway    <- unique(grp$feature)
+  factor_nm  <- unique(grp$metadata)
+  model_type <- unique(grp$model)
+  pathway_nm <- unique(grp$MetaCyc_Pathway)
+
+  df_plot <- abundance_long %>% filter(feature == pathway)
+  if (nrow(df_plot) == 0) next
+
+  safe_name <- make_safe_filename(pathway_nm)
+  ref_level <- levels(df_plot[[factor_nm]])[1]
+
+  linear_dir   <- file.path(plot_base, factor_nm, "Linear")
+  logistic_dir <- file.path(plot_base, factor_nm, "Logistic")
+  dir.create(linear_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(logistic_dir, recursive = TRUE, showWarnings = FALSE)
+
+  #------------------------------------
+  # Add (n=) counts to x-axis labels
+  n_per_level <- df_plot %>%
+    group_by(.data[[factor_nm]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")"))
+
+  df_plot <- df_plot %>%
+    left_join(n_per_level, by = setNames(factor_nm, factor_nm))
+
+  # Ensure label_x is a factor in the right order
+df_plot <- df_plot %>%
+  mutate(
+    label_x = factor(label_x, levels = n_per_level %>%
+                                       mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")")) %>%
+                                       pull(label_x))
+  )
+  
+  #Linear model
+  if (model_type == "abundance") {
+
+  # Compute counts per factor level for (n=)
+  n_per_level <- df_plot %>%
+    group_by(.data[[factor_nm]]) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(label_x = paste0(.data[[factor_nm]], " (n=", n, ")"))
+
+  
+  # Prepare significance annotations
+  # Calculate max per group
+# Calculate top per group and add proportional offset
+y_positions <- df_plot %>%
+  group_by(.data[[factor_nm]]) %>%
+  summarise(y_max = max(abundance, na.rm = TRUE), .groups = "drop") %>%
+  left_join(n_per_level, by = setNames(factor_nm, factor_nm)) %>%
+  mutate(
+    y_pos = y_max + 2   # adjust spacing if needed
+  )
+
+sig_annot <- grp %>%
+  filter(value != ref_level) %>%
+  mutate(
+    stars = q_to_stars(qval_joint),
+    label = paste0(stars, "\ncoef = ", round(coef, 2))
+  ) %>%
+  left_join(y_positions, by = c("value" = factor_nm)) %>%
+  mutate(value = label_x)
+
+ # add the q-value for subtitle (take first or min)
+  fdr_value <- signif(min(grp$qval_joint, na.rm = TRUE), 3)  # e.g., 1.23e-8
+
+
+  # Add a column to use the pathway name as y-axis label
+  df_plot <- df_plot %>%
+    mutate(pathway_label = pathway_nm)
+
+  p <- ggplot(df_plot, aes(x = label_x, y = abundance, fill = .data[[factor_nm]])) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75, width = 0.6) +
+  geom_jitter(width = 0.2, alpha = 0.6, size = 1) +
+  geom_text(
+  data = sig_annot,
+  aes(x = value, y = y_pos, label = label),
+  inherit.aes = FALSE,
+  size = 3.5,
+  vjust = 1   # anchors text "on" the y_pos
+) +
+  scale_fill_brewer(palette = "Set2") +
+ # scale_y_reverse() +   # <-- reverse y-axis
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  ) +
+  labs(
+    title = pathway_nm,   # keep title as before
+    subtitle = paste(" |coef| ≥", min_effect, " | FDR = ", fdr_value),
+    x = factor_nm,
+    y = "Log2(rel. abundance + 1e-5)"
+  )
+  
+  ggsave(
+    filename = paste0("Association_", safe_name, ".png"),
+    plot = p,
+    path = linear_dir,
+    width = 6,
+    height = 4.5,
+    dpi = 300
+  )
+}
+
+  #Prevalence model
+  if (model_type %in% c("prevalence", "logistic")) {
+
+    df_prev <- df_plot %>%
+      mutate(presence = factor(ifelse(abundance > 0, "Present", "Absent"),
+                               levels = c("Absent", "Present")))
+
+    sig_annot <- grp %>%
+      filter(value != ref_level) %>%
+      mutate(
+        stars = q_to_stars(qval_joint),
+        label = paste0(stars, "\ncoef = ", round(coef, 2))
+      ) %>%
+      left_join(n_per_level, by = c("value" = factor_nm)) %>%
+      mutate(value = label_x)
+
+    p <- ggplot(df_prev, aes(x = label_x, y = presence, fill = .data[[factor_nm]])) +
+      geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.6) +
+      geom_jitter(aes(color = .data[[factor_nm]]), height = 0.15, width = 0.2,
+                  size = 1, alpha = 0.6, show.legend = FALSE) +
+      geom_text(data = sig_annot, aes(x = value, y = 1.05, label = label),
+                inherit.aes = FALSE, size = 3.5, vjust = 0) +
+      scale_fill_brewer(palette = "Set2") +
+      scale_color_brewer(palette = "Set2") +
+      theme_bw(base_size = 12) +
+      theme(legend.position = "none",
+            plot.title = element_text(face = "bold")) +
+      labs(
+        title = pathway_nm,
+        subtitle = paste("Prevalence model | Median-centered test | |coef| ≥", min_effect),
+        x = factor_nm,
+        y = "Feature state"
+      )
+
+    ggsave(filename = paste0("Association_", safe_name, ".png"),
+           plot = p, path = logistic_dir, width = 6, height = 4.5, dpi = 300)
+  }
+}
+
+#################################################
+
+#SUMMARY TABLE
+
+#################################################
+
+
+
+# First, identify all metadata factors tested
+tested_metadata <- unique(sig_results_filtered$metadata)
+
+# Create an empty list to store top associations per metadata and model
+top_assoc_list <- list()
+
+for (meta in tested_metadata) {
+  
+  for (mod in c("abundance", "prevalence")) {
+    
+    # Subset significant results for this metadata and model
+    sig_meta <- sig_results_filtered %>%
+      filter(metadata == meta, model == mod) %>%
+      mutate(abs_coef = abs(coef))
+    
+    if(nrow(sig_meta) == 0) next  # skip if none
+    
+    # Get top 20 strongest associations by absolute coefficient
+    top_meta <- sig_meta %>%
+      slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+      ungroup() %>%
+      arrange(desc(abs_coef))
+    
+    # Compute mean relative abundance for each level of this metadata
+    abundance_means <- abundance_long %>%
+      filter(feature %in% top_meta$feature) %>%
+      group_by(feature, meta_level = .data[[meta]]) %>%
+      summarise(mean_abundance = mean(abundance, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = meta_level, values_from = mean_abundance)
+    
+    # Join abundances with top_meta
+    top_meta_with_abund <- top_meta %>%
+      left_join(abundance_means, by = "feature") %>%
+      mutate(model = mod)
+    
+    top_assoc_list[[paste(meta, mod, sep = "_")]] <- top_meta_with_abund
+  }
+}
+
+# Combine all metadata and model summaries
+top_assoc_all <- bind_rows(top_assoc_list)
+
+# Construct filename directly
+file_name <- paste0("Top", top_asso_nbr, paste0("_Taxon_", gsub("[^A-Za-z0-9]", "_", taxon)), "_strongest_associations_by_model.csv")
+
+# Save CSV directly inside plot_base
+write.csv(
+  top_assoc_all,
+  file.path(plot_base, file_name),
+  row.names = FALSE
+)
+
+
+# Preview in console
+message_txt <- paste0(
+  "=== Top ", top_asso_nbr, 
+  " strongest associations per metadata and model with mean relative abundances per factor level ==="
+)
+
+print(message_txt)
+print(top_assoc_all)
+
+#Summary barplot------------------------------------------
+library(tidyverse)
+
+# Only continue if Location exists in tested metadata
+if("Location" %in% top_assoc_all$metadata & "abundance" %in% top_assoc_all$model) {
+
+  top_location <- top_assoc_all %>%
+    filter(metadata == "Location", model == "abundance") %>%
+    slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+    arrange(desc(abs_coef)) %>%
+    mutate(
+      feature = factor(MetaCyc_Pathway, levels = MetaCyc_Pathway),
+      direction = ifelse(coef > 0, "UP", "DWN")
+    )
+
+  # Pivot only existing mean abundance columns (UP/DWN)
+  abund_cols <- intersect(c("UP", "DWN"), colnames(top_location))
+
+  if(length(abund_cols) > 0) {
+    abund_long <- top_location %>%
+      pivot_longer(cols = all_of(abund_cols), names_to = "Location_level", values_to = "mean_abundance")
+
+    # Make plot
+    p <- ggplot(top_location, aes(x = feature, y = coef, fill = direction)) +
+      geom_col(width = 0.7) +
+      coord_flip() +
+      scale_fill_manual(values = c("UP" = "#1f78b4", "DWN" = "#e31a1c")) +
+      labs(
+        x = "Pathway",
+        y = "Effect size (coef)",
+        fill = "Location"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        plot.title = element_text(face = "bold", size = 14)
+      )
+
+    print(p)
+
+    # Save the plot
+    ggsave(
+      filename = paste0("DAA_sum_plot_top", top_asso_nbr,"_UPvsDWN_", gsub("[^A-Za-z0-9]", "_", taxon), ".png"),
+      plot = p,
+      path = output_dir_tax,
+      width = 9, height = 4.5, dpi = 300
+    )
+  } else {
+    message("  No UP/DWN columns present for plotting Location effect.")
+  }
+} else {
+  message("  No significant Location abundance results to plot for this taxon.")
+}
+
+#SSummary bar plot for top Lifestage effects (Larvae vs Adult)
+#----------------------------------------
+if("Lifestage" %in% top_assoc_all$metadata & "abundance" %in% top_assoc_all$model) {
+
+  # Check if both levels are present
+  lifestage_levels <- intersect(c("Larvae", "Adult"), colnames(top_assoc_all))
+  if(length(lifestage_levels) == 2) {
+
+    top_life <- top_assoc_all %>%
+      filter(metadata == "Lifestage", model == "abundance") %>%
+      slice_max(order_by = abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+      arrange(desc(abs_coef)) %>%
+      mutate(
+        feature = factor(MetaCyc_Pathway, levels = MetaCyc_Pathway),
+        direction = ifelse(coef > 0, "Adult", "Larvae")
+      )
+
+    # Pivot only existing columns for mean abundance
+    abund_cols <- intersect(c("Adult", "Larvae"), colnames(top_life))
+    abund_long <- top_life %>%
+      pivot_longer(cols = all_of(abund_cols), names_to = "Lifestage_level", values_to = "mean_abundance")
+
+    # Plot
+    p <- ggplot(top_life, aes(x = feature, y = coef, fill = direction)) +
+      geom_col(width = 0.7) +
+      coord_flip() +
+      scale_fill_manual(values = c("Adult" = "#1f78b4", "Larvae" = "#e31a1c")) +
+      labs(
+        x = "Pathway",
+        y = "Effect size (coef)",
+        fill = "Lifestage"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 12),
+        plot.title = element_text(face = "bold", size = 14)
+      )
+
+    print(p)
+
+    # Save the plot
+    ggsave(
+      filename = paste0("DAA_sum_plot_top", top_asso_nbr,"_AdultvsLarvae_", gsub("[^A-Za-z0-9]", "_", taxon), ".png"),
+      plot = p,
+      path = output_dir_tax,
+      width = 9, height = 4.5, dpi = 300
+    )
+
+  } else {
+    message("  Skipping Lifestage plot: not both Larvae and Adult present.")
+  }
+
+} else {
+  message("  No significant Lifestage abundance results to plot for this taxon.")
+}
+
+
+ }
+
+```
+
+## MaAsLin3 -pathways by sample type
+
+```{r}
+sample_type_list <- unique(metadata$Sample_Type)
+
+min_effect   <- 0.75
+alpha_sig    <- 0.05
+top_asso_nbr <- 20
+
+output_base <- file.path(output_dir, "PICRUSt2_MaAsLin3_by_sample_type")
+
+if (dir.exists(output_base)) unlink(output_base, recursive = TRUE, force = TRUE)
+dir.create(output_base, recursive = TRUE)
+
+# Loop over sampe types
+for (stype in sample_type_list) {
+
+  message("Processing Sample_Type: ", stype)
+
+
+  # Subset metadata
+  meta_sub <- metadata %>%
+    filter(Sample_Type == stype)
+
+  meta_sub$Site     <- factor(meta_sub$Site)
+  meta_sub$Location <- factor(meta_sub$Location)
+
+  if (nrow(meta_sub) < 10) {
+    message("  Skipping (too few samples)")
+    next
+  }
+
+  if (length(unique(meta_sub$Location)) < 2) {
+    message("  Skipping (only one location)")
+    next
+  }
+
+  # Subset abundance
+  abundance_mat_sub <- abundance_mat_filtered[rownames(meta_sub), , drop = FALSE]
+
+  keep <- colSums(abundance_mat_sub > 0)/nrow(abundance_mat_sub) > 0.1
+  abundance_mat_sub_filtered <- abundance_mat_sub[, keep]
+
+#output
+  output_dir_stype <- file.path(
+    output_base,
+    paste0("SampleType_", gsub("[^A-Za-z0-9]", "_", stype))
+  )
+  dir.create(output_dir_stype, showWarnings = FALSE)
+
+  #Run maaslin
+  fit <- maaslin3(
+    input_data = abundance_mat_sub_filtered,
+    input_metadata = meta_sub,
+    output = output_dir_stype,
+    fixed_effects = "Location",
+    random_effects = "Site",
+    normalization = "TSS",
+    transform = "LOG",
+    standardize = TRUE,
+    small_random_effects = TRUE
+  )
+
+  # Results
+  res_file <- file.path(output_dir_stype, "all_results.tsv")
+  res <- read_tsv(res_file, show_col_types = FALSE)
+
+  pathway_key <- read.csv(file.path(output_full, "Pathway_Name_Key.csv"))
+  res <- res %>% left_join(pathway_key, by = c("feature" = "Safe_ID"))
+
+  sig_results <- res %>%
+    filter(qval_joint <= alpha_sig)
+
+  write.csv(
+    sig_results,
+    file.path(output_dir_stype, "Significant_results.csv"),
+    row.names = FALSE
+  )
+
+  # abundance long
+  abundance_long <- abundance_mat_sub_filtered %>%
+    rownames_to_column("Sample_ID") %>%
+    pivot_longer(-Sample_ID, names_to = "feature", values_to = "abundance") %>%
+    left_join(meta_sub, by = c("Sample_ID" = "Study_ID")) %>%
+    mutate(Location = factor(Location, levels = c("UP", "DWN")))
+
+  # Top assiciation (Location only)
+  top_location <- sig_results %>%
+    filter(model == "abundance",
+           metadata == "Location",
+           abs(coef) >= min_effect) %>%
+    mutate(abs_coef = abs(coef)) %>%
+    slice_max(abs_coef, n = top_asso_nbr, with_ties = FALSE) %>%
+    arrange(desc(abs_coef))
+
+  write.csv(
+    top_location,
+    file.path(output_dir_stype,
+              paste0("Top", top_asso_nbr, "_Location_associations.csv")),
+    row.names = FALSE
+  )
+
+  #mean abundance per location
+  abundance_means <- abundance_long %>%
+    filter(feature %in% top_location$feature) %>%
+    group_by(feature, Location) %>%
+    summarise(mean_abundance = mean(abundance), .groups = "drop") %>%
+    pivot_wider(names_from = Location,
+                values_from = mean_abundance)
+
+  top_location <- top_location %>%
+    left_join(abundance_means, by = "feature")
+
+  # Summary bar plot
+  plot_df <- top_location %>%
+    mutate(
+      Pathway = fct_reorder(MetaCyc_Pathway, coef),
+      direction = ifelse(coef > 0, "UP", "DWN")
+    )
+
+  p <- ggplot(plot_df,
+              aes(x = MetaCyc_Pathway,
+                  y = coef,
+                  fill = direction)) +
+    geom_col(width = 0.7) +
+    coord_flip() +
+    scale_fill_manual(values = c("UP" = "#1f78b4",
+                                 "DWN" = "#e31a1c")) +
+    theme_minimal(base_size = 13) +
+    labs(
+      title = paste("Top Location effects –", stype),
+      x = "Pathway",
+      y = "Effect size (MaAsLin coef)",
+      fill = "Higher in"
+    )
+
+  ggsave(
+    filename = paste0("DAA_Top", top_asso_nbr,
+                      "_Location_", stype, ".png"),
+    plot = p,
+    path = output_dir_stype,
+    width = 9,
+    height = 5,
+    dpi = 300
+  )
+}
+```

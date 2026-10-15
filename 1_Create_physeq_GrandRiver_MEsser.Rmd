@@ -1,0 +1,693 @@
+---
+title: "Grand River microbiome Analysis 2022 - Creating phyloseq objects"
+author: "Milena Esser"
+date: "29/04/2025"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup-1, include=F}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+rm(list=ls()) #Clears environment  
+
+library(phyloseq)
+library(tidyverse)
+library(metagenomeSeq) # Cumulative Sum Scaling
+library(vegan)
+library(Biostrings) # to add DNAStringSet object for ASV sequences in phyloseq to store DNA sequences, to allow sequence-based operations
+
+library(MicEco)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(decontam)
+library(ggplot2)
+
+#output direction
+output_dir <-paste0("R_output")
+if (!dir.exists("R_output")) {
+  dir.create("R_output")
+}
+```
+
+1.  This script creates a phyloseq object from the following input files:
+
+- feature_table.tsv
+
+- taxonomy_table.tsv
+
+- metadata.tsv
+
+2.  After ***creating the phyloseq object***, there is a filtering step to remove contaminated samples, controls, as well as Chloroplasts and Mitochondria.
+3.  The script includes multiple options to ***normalize for varying sequencing depth*** (e.g., rarefaction, proportional normalization, CSS) for ecological metrics analysis (e.g., alpha/beta diversity0
+4.  Lastly, the resulting ***phyloseq objects are saved for use in downstream analyses*** such as diversity assessment and differential abundance. *(**IMPORTANT**: This includes normalized ps files, as well as the unnormalized ps, as some downstream analysis have their own normalization/transformation methods, e.g., DeSeq2 for differential abundance analysis using variance stabilizing transformation (VST), which normalizes for varying sequencing depth and dispersion*)
+
+## **Create and Filter Phyloseq object**
+
+Make sure your ASV table has a column for ASV IDs and the rest are sample counts.
+
+```{r load-and-format-ASV-table}
+ASVseq<-read.csv("data\\seqtab_nochim_transposed_KKBrittany-GrandRiver-June2023_v34.csv")
+
+#The row names have to be the ASV identifier (genetic barcode) in order for it to be read. The following lines of code are to re-organize the row names
+n1 <- ASVseq$X #Currently the ASVs are being called "X" in the first column. We want them to be unnamed in the row names column
+ASVseq <- ASVseq[,-1] #This removes the first column of the ASV dataframe
+rownames(ASVseq) <- n1 #This moves the ASVs to the rownames column of the dataframe
+
+ASVtable <- as.matrix(ASVseq) #must be a matrix so we convert to a matrix
+#View(ASVtable) #The ASVs are now the row names
+```
+
+The taxonomy table should have ASV IDs in the first column and taxonomy as separate columns or a single concatenated string (e.g., `"Kingdom;Phylum;Class;..."`).
+
+```{r load-and-process-taxonomy-table}
+#Importing taxa table
+taxonomy <-read.csv ("data\\taxa_KKBrittany-GrandRiver-June2023_v34_silva138wsp.csv")
+
+#Using the same steps as above with the ASV table to make the genetic barcode the rowname
+n2 <- taxonomy$X
+taxonomy <- taxonomy[,-1]
+rownames(taxonomy) <- n2
+
+taxa_table<-as.matrix(taxonomy) #Turn into a matrix
+#View(taxa_table) #ASVs are now the row names
+```
+
+```{r load-and-process-metadata}
+# Read the CSV
+metadata <- read.csv("data\\KK-Brittany-sample info sheet June2023.csv")
+
+# Replace dots with underscores
+names(metadata) <- gsub("\\.", "_", names(metadata))
+
+# Remove trailing underscores (1 or more)
+names(metadata) <- gsub("_+$", "", names(metadata))
+
+# Proceed with modifying your data
+metadata$Lifestage <- ordered(metadata$Lifestage, levels = c("Larvae", "Adult", "Spider"))
+
+# Extract Study_ID as row names
+n3 <- metadata$Study_ID
+
+# Remove Study_ID column from metadata
+metadata <- metadata[, !(names(metadata) == "Study_ID")]
+
+# Assign row names
+rownames(metadata) <- n3
+
+# View the updated metadata
+#View(metadata)
+```
+
+```{r create-and-save-ps-object}
+# Create phyloseq components
+OTU <- otu_table(ASVtable, taxa_are_rows = TRUE)
+TAX <- tax_table(taxa_table)
+SAM <- sample_data(metadata)
+
+# Create phyloseq object
+ps <- phyloseq(OTU, SAM, TAX)
+
+# Add DNA sequences if ASV names are the actual DNA barcodes
+dna_ASV <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna_ASV) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna_ASV)
+
+# Rename ASVs to ASV1, ASV2, etc
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+
+```
+
+### Filtering
+
+So far, the data includes multiple data sets from different studies. So I first filter out the Grand River data.
+
+```{r filter-project-data}
+ps <-subset_samples(ps, Study  == "Grand River T3 2022")
+ps_study <- ps
+```
+
+Filter out potentially contaminated samples:
+
+- KK2580 (WAT_DWN3_Ad_Mayfly_MB_3) appeared as outlier during beta diversity analysis as it had an MDS1 of \>4000. Remove from dataset:
+
+```{r filter-out-samples}
+
+outlier_samples <- c("WAT_DWN3_Ad_Mayfly_MB_3")
+ps <- subset_samples(ps, !(Sample_ID %in% outlier_samples))
+
+```
+
+The following does:
+
+1.  **Subset to experimental samples**\
+    Removes any samples where `Lifestage` is `NA`, likely excluding blanks or non-target samples.
+
+2.  **Keep only prokaryotes (Bacteria and Archaea)**\
+    Filters out all non-prokaryotic sequences such as Eukaryotes and unclassified domains. The code also tracks how many ASVs were removed and how many were Archaea.
+
+3.  **Remove organelle-derived sequences**\
+    Filters out ASVs assigned to chloroplasts or mitochondria, which are common contaminants from host or plant material in 16S datasets.
+
+4.  **Remove rare ASVs**\
+    Uses `ps_prune()` to exclude ASVs that have fewer than 5 reads and are present in fewer than 2 samples.
+
+5.  **Remove low-read samples**\
+    Filters out any samples with fewer than 1000 total reads, ensuring sufficient sequencing depth.
+
+6.  **Keep only ASVs present with \>10 reads in at least one sample**\
+    Focuses the analysis on more confidently observed taxa.
+
+7.  **Remove poorly classified ASVs at the Phylum level**\
+    Excludes any taxa that lack a clear phylum-level classification or are ambiguously labeled (e.g., `"uncharacterized"` or `"NA"`).
+
+```{r filtering-and-clean-up}
+
+# Remove taxa with zero total abundance 
+psexp <- prune_taxa(taxa_sums(ps) > 0, ps) 
+
+# Keep only Bacteria and Archaea
+ps_bacteria <- subset_taxa(psexp, Kingdom == "Bacteria")
+ps_bacteria_archaea <- subset_taxa(psexp, Kingdom %in% c("Bacteria", "Archaea"))
+
+# Compare ASVs retained
+cat("ASVs removed (non-Bacteria/Archaea):", ntaxa(psexp) - ntaxa(ps_bacteria_archaea), "\n")
+cat("Archaea-only ASVs:", ntaxa(ps_bacteria_archaea) - ntaxa(ps_bacteria), "\n")
+
+# Continue with Bacteria + Archaea
+ps1 <- ps_bacteria_archaea
+
+# Remove organelle-associated ASVs (chloroplasts, mitochondria)
+ps2 <- subset_taxa(ps1, 
+                   !Order %in% c("", "Chloroplast") & 
+                   !Family %in% c("", "Mitochondria"))
+
+cat("ASVs removed (Chloroplasts/Mitochondria):", ntaxa(ps1) - ntaxa(ps2), "\n")
+
+# Filter out low-abundance taxa (e.g., <5 reads in <2 samples)
+ps_filt <- ps_prune(ps2, min.reads = 5, min.samples = 2)
+
+#Remove artificial "Others" category if added by ps_prune()
+ps_filt <- prune_taxa(taxa_names(ps_filt)[taxa_names(ps_filt) != "Others"], ps_filt)
+
+# Remove any taxa with zero read
+ps_filt <- prune_taxa(taxa_sums(ps_filt) > 0, ps_filt)
+
+#Remove samples with fewer than 1000 total reads
+ps_filt <- prune_samples(sample_sums(ps_filt) >= 1000, ps_filt)
+
+#Keep only taxa present with >10 reads in at least one sample
+ps_filt <- filter_taxa(ps_filt, function(x) sum(x > 10) > 0, prune = TRUE)
+
+#Remove unclassified or ambiguous Phylum-level taxa
+ps_filt <- subset_taxa(ps_filt, 
+                        !is.na(Phylum) & 
+                        !Phylum %in% c("", "uncharacterized", "NA"))
+
+# Output final phyloseq object
+ps_final<-ps_filt
+
+cat("Final PS object after filtering:", "\n")
+ps_final 
+
+cat("Original number of samples:", nsamples(psexp), "\n")
+cat("Number of samples remaining after filtering:", nsamples(ps_final), "\n")
+```
+
+#### Controls
+
+Using decontam to remove background from kits etc.
+
+```{r che-blanks}
+
+
+# 1. Set up is.neg across the whole dataset
+sample_data(ps_filt)$is.neg <- sample_data(ps_filt)$Sample_Type %in% 
+  c("MBDI_RINSE", "SHEET_BLANK")
+
+cat("is.neg counts:\n")
+print(table(sample_data(ps_filt)$is.neg))
+
+# ---------------------------------------------------------
+# 2. Run decontam (prevalence method) across all samples
+
+contamdf.prev <- isContaminant(ps_filt, method = "prevalence", neg = "is.neg")
+
+cat("Contaminant counts:\n")
+print(table(contamdf.prev$contaminant))
+
+
+# Prevalence plot
+ps.pa <- transform_sample_counts(ps_filt, function(x) (x > 0) * 1)
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$is.neg == TRUE, ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$is.neg == FALSE, ps.pa)
+
+df.pa <- data.frame(
+  pa.pos = taxa_sums(ps.pa.pos),
+  pa.neg = taxa_sums(ps.pa.neg),
+  contaminant = contamdf.prev$contaminant
+)
+
+n_neg <- nsamples(ps.pa.neg)
+n_pos <- nsamples(ps.pa.pos)
+
+plot_all <- ggplot(df.pa, aes(x = pa.neg, y = pa.pos, color = contaminant)) +
+  geom_point(alpha = 0.6) +
+  xlab(paste0("Prevalence (All blanks combined, n=", n_neg, ")")) +
+  ylab(paste0("Prevalence (True samples, n=", n_pos, ")")) +
+  ggtitle("All Samples vs. All Blanks Combined") +
+  theme_bw()
+
+print(plot_all)
+
+# ---------------------------------------------------------
+#  Inspect flagged taxa
+
+contam_taxa <- rownames(contamdf.prev)[contamdf.prev$contaminant == TRUE]
+cat("Number of ASVs flagged as contaminants:", length(contam_taxa), "\n")
+
+tax_table(ps_filt)[contam_taxa, ]
+
+# ---------------------------------------------------------
+# Prune contaminants from the full dataset
+
+ps_noncontam <- prune_taxa(!contamdf.prev$contaminant, ps_filt)
+
+cat("Original PS object:\n")
+print(ps_filt)
+cat("\nPS object after decontam:\n")
+print(ps_noncontam)
+
+ps_final<-ps_noncontam
+```
+
+## **Investigating Sequencing Depth**
+
+### Rarefaction curve
+
+```{r rarefaction-curve, include=FALSE}
+# Show sequencing depth stats
+seq_depths <- sample_sums(ps_final)
+cat("Minimum sequencing depth:", min(seq_depths), "\n")
+cat("Maximum sequencing depth:", max(seq_depths), "\n")
+cat("Total reads across all samples:", sum(seq_depths), "\n")
+
+# Create OTU table matrix for rarecurve
+tab <- otu_table(ps_final)
+if (taxa_are_rows(ps_final)) {
+  tab <- t(tab)
+}
+tab <- as(tab, "matrix")  # now samples are rows
+
+# Get Sample Type for coloring
+sample_info <- data.frame(sample_data(ps_final))
+sample_info <- sample_info[rownames(tab), , drop = FALSE]  # Match row order
+group_factor <- as.factor(sample_info$Sample_Type)
+group_palette <- setNames(rainbow(length(levels(group_factor))), levels(group_factor))
+group_colors <- group_palette[as.character(group_factor)]
+
+# Save rarefaction curve as PNG
+file <- paste0(output_dir, "/rarefaction_curves_by_sample_type.png")
+
+png(filename = file, width = 1200, height = 800, res = 150)
+rarecurve(tab, step = 5000, label = FALSE,
+          ylab = "Observed OTUs", xlab = "Sequencing Depth",
+          col = group_colors, lwd = 2)
+legend("bottomright", legend = names(group_palette),
+       col = group_palette, lty = 1, lwd = 2, title = "Sample Type")
+dev.off()
+
+```
+
+### Goods coverage estimate
+
+= 1-(F1/N)
+
+F1= number of singletons (reads that only occur once)
+
+N=number of reads per sample
+
+**Rule of thumb:** Values \>95% are generally considered good coverage
+
+If your samples show lower coverage, especially inconsistently across groups, this can bias diversity estimates.
+
+```{r goods-coverage-estimate, include=FALSE}
+# Prepare OTU matrix
+otu <- otu_table(ps_final)
+if (taxa_are_rows(ps_final)) {
+  otu <- t(otu)
+}
+otu <- as(otu, "matrix")  # Samples = rows
+
+# Calculate Good's Coverage
+goods_coverage <- apply(otu, 1, function(x) {
+  singletons <- sum(x == 1)
+  total_reads <- sum(x)
+  1 - (singletons / total_reads)
+})
+
+# Create summary table with metadata
+coverage_df <- data.frame(
+  SampleID = names(goods_coverage),
+  GoodsCoverage = goods_coverage,
+  sample_data(ps_final)[names(goods_coverage), , drop = FALSE]
+)
+
+# Show summary statistics in report
+cat("Good's Coverage Summary:\n")
+summary(goods_coverage)
+
+#plot
+coverage_plot <- ggplot(coverage_df, aes(x = Sample_Type, y = GoodsCoverage)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6, color = "blue") +
+  geom_hline(yintercept = 0.95, linetype = "dashed", color = "red") +
+  labs(title = "Good's Coverage by Sample Type",
+       y = "Good's Coverage", x = "Sample Type") +
+  theme_minimal()
+
+
+coverage_plot
+```
+
+```{r save-goods-coverage-plot, eval=TRUE, include=FALSE}
+
+
+output_base <- file.path(output_dir, "goods_coverage_by_sampletype")
+
+# Save as PNG
+ggsave(filename = paste0(output_base, ".png"), plot = coverage_plot, width = 8, height = 6, dpi = 300)
+
+# Save as PDF
+ggsave(filename = paste0(output_base, ".pdf"), plot = coverage_plot, width = 8, height = 6)
+
+```
+
+## **Normalization**
+
+Normalization is currently a much-discussed issue of microbiome studies. Differences in read depth between samples often need to be corrected before analysis. Several normalization methods have been proposed, and no single method is perfect. It may be that the most appropriate method depends on the analysis.
+
+### Rarefaction
+
+Rarefaction can be used to subset data such that the library depth is the same for each sample. Because sampling of the data is random, rarefaction can account for an effect of total read count on taxa richness. The sequencing depth differs considerably between taxonomic groups (spiders have very low read counts), therefore rarefaction may not be ideal for normalization here.
+
+This code helps finding a rarefaction level with a minimum of 4 replicates left per taxonomic group and site
+
+```{r identifying-rarefaction-cut-off, results='hide', include=FALSE}
+# Get sequencing depth for each sample
+depths <- sample_sums(ps_final)
+
+# Get sample metadata
+meta <- data.frame(sample_data(ps_final))
+meta$SampleID <- rownames(meta)
+meta$depth <- depths
+
+# Set candidate rarefaction depths (e.g., 1000 to 30,000 by 1000s)
+depth_candidates <- seq(1000, 30000, by = 1000)
+
+# Create a function to count number of samples ≥ depth per group
+count_valid_reps <- function(min_depth) {
+  meta %>%
+    filter(depth >= min_depth) %>%
+    group_by(Site_ID, Sample_Type) %>%
+    summarise(n_samples = n(), .groups = "drop") %>%
+    mutate(rarefy_depth = min_depth)
+}
+
+depth_summary <- map_dfr(depth_candidates, count_valid_reps)
+
+#Find sequencing depth with at least 4 samples per replicate (sample type and site)
+# For each rarefaction depth, count how many site × sample type have ≥4 samples
+summary_by_depth <- depth_summary %>%
+  group_by(rarefy_depth) %>%
+  summarise(n_groups_with_4plus = sum(n_samples >= 4))
+
+# View results
+print(summary_by_depth)
+```
+
+```{r more-detailed, results='hide', include=FALSE}
+#Sweetspot seems to be between 2000 and 3000 so lets check again
+# Set candidate rarefaction depths (e.g., 1000 to 30,000 by 1000s)
+depth_candidates <- seq(2000, 3000, by = 100)
+
+depth_summary <- map_dfr(depth_candidates, count_valid_reps)
+
+summary_by_depth <- depth_summary %>%
+  group_by(rarefy_depth) %>%
+  summarise(n_groups_with_4plus = sum(n_samples >= 4))
+
+
+# View results
+print(summary_by_depth)
+
+#check sequencing depths in range
+sort(sample_sums(ps_final))
+
+#2247 is minimum
+```
+
+**IMPORTANT**: *the normalization level selected here has been identified based on the data itself (keeping it as high as possible without losing too many samples due to low sequencing depth). Therefore, this needs to be adjusted in case of differing data.*
+
+*Also: The diversity differs significantly between some of the taxonomic groups sampled (e.g., spiders have generally very low diversity). It may be better to rarefy them separately, but this would not allow for comparison between taxonomic groups!.*
+
+```{r rarefying-data}
+##Rarefying the data (remove samples to lead to min replicate number per sample group)
+  
+rarefaction_lvl <- 2247
+cat("The selected rarefaction level is:", rarefaction_lvl," reads \n")
+
+# Rarefy the phyloseq object to the specified sequencing depth that has been identified in the previous section 
+ps_rare <- phyloseq::rarefy_even_depth(ps_final, sample.size = rarefaction_lvl, rngseed = 123, replace = FALSE)
+
+#Final dataset
+#sort(sample_sums(ps_rare)) 
+cat("rarefied PS object (ps_rare):","\n")
+ps_rare
+
+# Check minimum number of samples per replicate
+
+# Extract metadata from phyloseq object
+meta <- data.frame(sample_data(ps_rare))
+
+# Summarize number of samples per group (site level)
+summary_site <- meta %>%
+  group_by(Site_ID, Sample_Type) %>%
+  summarise(n_samples = n(), .groups = "drop")
+
+# Plot samples per site
+plot_samples_per_site <- ggplot(summary_site, aes(x = Site_ID, y = n_samples, fill = Sample_Type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_hline(yintercept = 4, color = "red", linetype = "dotted", size = 1) +  # Threshold line
+  labs(
+    title = "Number of Samples per Site and Taxonomic Group",
+    x = "Site",
+    y = "Number of Samples",
+    fill = "Taxonomic Group"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_line(color = "grey80", size = 0.5),
+    panel.grid.minor.x = element_line(color = "grey90", size = 0.25)
+  )
+
+cat("Number of samples left per sample type and site after rarefaction:","\n")
+plot_samples_per_site
+
+# Save plots to files
+ggsave(filename = file.path(output_dir, "samples_per_site_taxgroup.png"),
+       plot = plot_samples_per_site, width = 10, height = 6, dpi = 300)
+
+ggsave(filename = file.path(output_dir, "samples_per_site_taxgroup.pdf"),
+       plot = plot_samples_per_site, width = 10, height = 6)
+
+
+```
+
+### Read tracking table - AFTER REVISION
+
+```{r read-tracking-table}
+
+# re-runs filtering steps exactly as in the script, records the reads per sample after each step, and checks if reproduces ps_filt object
+
+# ---------------------------------------------------------------------
+# Re-run each filtering step (mirrors the main script)
+
+s0 <- ps_study                                                   # DADA2 non-chimeric ASV table, this study
+s1 <- subset_samples(s0, !(Sample_ID %in% outlier_samples))      # outlier removed
+s1 <- prune_taxa(taxa_sums(s1) > 0, s1)
+
+s2 <- subset_taxa(s1, Kingdom %in% c("Bacteria", "Archaea"))     # prokaryotes only
+
+s3 <- subset_taxa(s2,                                            # organelles removed
+                  !Order  %in% c("", "Chloroplast") &
+                    !Family %in% c("", "Mitochondria"))
+
+s4 <- ps_prune(s3, min.reads = 5, min.samples = 2)               # rare ASVs removed
+s4 <- prune_taxa(taxa_names(s4)[taxa_names(s4) != "Others"], s4)
+s4 <- prune_taxa(taxa_sums(s4) > 0, s4)
+
+s5 <- prune_samples(sample_sums(s4) >= 1000, s4)                 # samples < 1000 reads removed
+
+s6 <- filter_taxa(s5, function(x) sum(x > 10) > 0, prune = TRUE) # ASVs with >10 reads in >=1 sample
+
+s7 <- subset_taxa(s6,                                            # unclassified phyla removed
+                  !is.na(Phylum) &
+                    !Phylum %in% c("", "uncharacterized", "NA"))
+
+# Sanity check: s7 should be identical to ps_filt from the main script
+stopifnot(identical(sample_sums(s7), sample_sums(ps_filt)))
+
+contam_ids <- rownames(contamdf.prev)[contamdf.prev$contaminant]  # decontam
+s8 <- prune_taxa(!(taxa_names(s7) %in% contam_ids), s7)
+
+s9 <- ps_rare                                                     # rarefied (2247 reads)
+
+
+#Collect read counts per sample and step
+
+steps <- list(
+  "DADA2 non-chimeric"            = s0,
+  "Outlier removed"               = s1,
+  "Bacteria + Archaea"            = s2,
+  "Chloroplast/mitochondria removed" = s3,
+  "Rare ASVs removed (<5 reads, <2 samples)" = s4,
+  "Samples >= 1000 reads"         = s5,
+  "ASVs >10 reads in >=1 sample"  = s6,
+  "Classified phyla"              = s7,
+  "Decontam"                      = s8,
+  "Rarefied (2247 reads)"         = s9
+)
+
+track <- purrr::imap(steps, ~ tibble::tibble(Sample = sample_names(.x),
+                                             !!.y := as.numeric(sample_sums(.x)))) %>%
+  purrr::reduce(dplyr::full_join, by = "Sample")
+
+# Add metadata, % retained and where each sample was removed
+meta <- data.frame(sample_data(s0)) %>%
+  rownames_to_column("Sample") %>%
+  dplyr::select(Sample, any_of(c("Sample_ID", "Sample_Type", "Lifestage", "Site_ID")))
+
+step_names <- names(steps)
+
+track <- track %>%
+  mutate(
+    `% retained after filtering` =
+      round(100 * Decontam / `DADA2 non-chimeric`, 1),
+    Status = apply(across(all_of(step_names)), 1, function(r) {
+      first_na <- which(is.na(r))[1]
+      if (is.na(first_na)) "Retained" else paste("Removed at:", step_names[first_na])
+    })
+  ) %>%
+  left_join(meta, by = "Sample") %>%
+  relocate(any_of(c("Sample_ID", "Sample_Type", "Lifestage", "Site_ID")), .after = Sample) %>%
+  arrange(Sample_Type, Site_ID, Sample)
+
+
+# Summary across samples
+
+track_summary <- track %>%
+  mutate(Group = ifelse(Sample_Type %in% c("MBDI_RINSE", "SHEET_BLANK"),
+                        "Negative control", "Sample")) %>%
+  group_by(Group) %>%
+  summarise(across(all_of(step_names),
+                   list(n      = ~ sum(!is.na(.x)),
+                        total  = ~ sum(.x, na.rm = TRUE),
+                        median = ~ median(.x, na.rm = TRUE),
+                        min    = ~ min(.x, na.rm = TRUE),
+                        max    = ~ max(.x, na.rm = TRUE)),
+                   .names = "{.col}__{.fn}"),
+            .groups = "drop") %>%
+  tidyr::pivot_longer(-Group,
+                      names_to = c("Step", ".value"),
+                      names_sep = "__") %>%
+  mutate(Step = factor(Step, levels = step_names)) %>%
+  arrange(Group, Step)
+
+print(track_summary, n = Inf)
+
+#save
+write.csv(track, file.path(output_dir, "TableS_read_tracking_per_sample.csv"),
+          row.names = FALSE, na = "")
+write.csv(track_summary, file.path(output_dir, "TableS_read_tracking_summary.csv"),
+          row.names = FALSE)
+
+if (requireNamespace("openxlsx", quietly = TRUE)) {
+  openxlsx::write.xlsx(list("Per sample" = track, "Summary" = track_summary),
+                       file.path(output_dir, "TableS_read_tracking.xlsx"),
+                       keepNA = FALSE)
+}
+```
+
+### Proportion normalization
+
+Proportion normalization involves dividing each OTU count by the total sum for each sample. The resulting count data will add up to 1 (100%) for each sample.
+
+```{r TSS-normalization}
+# Proportion normalization:
+ps_prop <- transform_sample_counts(ps_final, function(x) x / sum(x))
+
+# Have a look at the resulting OTU table:
+otu_table(ps_prop)[1:5, 1:5]
+
+#the sums for each sample should be 1 now:
+head(sample_sums(ps_prop))
+```
+
+### Cumulative Sum Scaling (CSS)
+
+The *metagenomeSeq* Cumulative Sum Scaling (CSS) normalization is another option developed for microbiome data. For more information, read [Paulson et al. 2013](http://www.nature.com/articles/nmeth.2658).
+
+```{r CSS-normalization}
+# Convert the phyloseq object to a metagenomeseq object:
+mgs_css <- phyloseq_to_metagenomeSeq(ps_final)
+
+# Perform the Cumulative Sum Scaling:
+mgs_css <- cumNorm(mgs_css)
+
+# Extract the counts and add them to a separate phyloseq object:
+css_counts <- MRcounts(mgs_css, norm = TRUE)
+ps_css <- ps_final
+otu_table(ps_css) <- otu_table(t(css_counts), taxa_are_rows = FALSE)
+
+# Have a look at the resulting OTU table:
+otu_table(ps_css)[1:5, 1:5]
+#ps_css
+```
+
+## **Save phyloseq object for easy reloading**
+
+```{r save-phyloseq-objects, results='asis', echo=FALSE}
+# Save the processed phyloseq objects to .RData files
+ps_dir <- file.path("R_output", "ps_objects")
+if (!dir.exists(ps_dir)) {
+  dir.create(ps_dir, recursive = TRUE)
+}
+# Save objects to ps_dir
+save(ps_final, file = file.path(ps_dir, "GrandRiverMB_phyloseq_filt_unnorm.RData"))
+save(ps_rare,  file = file.path(ps_dir, "GrandRiverMB_phyloseq_filt_rar.RData"))
+save(ps_prop,  file = file.path(ps_dir, "GrandRiverMB_phyloseq_filt_propnorm.RData"))
+save(ps_css,   file = file.path(ps_dir, "GrandRiverMB_phyloseq_filt_css.RData"))
+save(ps_with_blanks, file = file.path(ps_dir, "GrandRiverMB_phyloseq_blanks.RData"))
+
+
+# Output explanation in Markdown
+cat("
+**Saved phyloseq objects:**  
+
+- ***ps_final*** (Unrarefied, filtered): `GrandRiverMB_phyloseq_filt_unnorm.RData`  
+- ***ps_rare*** (Rarefied to even sequencing depth): `GrandRiverMB_phyloseq_filt_rar.RData`  
+- ***ps_prop*** (Proportion-normalized to relative abundance): `GrandRiverMB_phyloseq_filt_propnorm.RData`  
+- ***ps_css*** (CSS-normalized for compositionality and sequencing depth): `GrandRiverMB_phyloseq_filt_css.RData`  
+")
+
+```

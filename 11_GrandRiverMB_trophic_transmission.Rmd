@@ -1,0 +1,300 @@
+---
+title: "7_GrandRiverMB_pot_vertically_transmitted_taxa"
+author: "Milena Esser"
+date: "2025-07-16"
+output:
+  html_document: 
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+## Purpose
+
+This script identifies **candidate trophically transmitted ASVs**: Present in **adult insects and spiders**
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r setup, include=FALSE} knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls()) # Clean environment
+
+library(tidyverse)
+library(ggrepel)
+library(viridis)
+library(patchwork)
+```
+
+## Load data
+
+```{r load-data}
+load("R_output/ps_objects/GrandRiverMB_phyloseq_filt_unnorm.RData")
+
+# Define prevalence Thresholds
+label_threshold <- 0.5           # For bold (vertically transmitted) SP:0.5, 
+gray_label_threshold <- 0.7      # For gray (high prevalence in either stage)
+# -----------------------------
+# User-defined taxonomic rank
+taxrank <- "Genus"   # e.g., "Species", "Genus", "Family"
+# -----------------------------
+```
+
+```{r prep-phlyloseq-object}
+ps <- tax_glom(ps_final, taxrank = taxrank)
+otu <- as.data.frame(otu_table(ps))
+if (taxa_are_rows(ps)) otu <- t(otu)
+otu <- as.data.frame(otu)
+otu <- otu[, sapply(otu, is.numeric)]
+
+meta <- as(sample_data(ps), "data.frame")
+taxonomy_df <- as.data.frame(tax_table(ps))
+
+# Create readable Taxon Label
+if (taxrank == "Species") {
+  taxonomy_df$Taxon_Label <- paste(taxonomy_df$Genus, taxonomy_df$Species, sep = "_")
+} else {
+  taxonomy_df$Taxon_Label <- taxonomy_df[[taxrank]]
+}
+
+taxonomy_df$Taxon_Label <- gsub(" ", "_", taxonomy_df$Taxon_Label)
+taxonomy_df$Taxon_Label <- gsub("__+", "_", taxonomy_df$Taxon_Label)
+taxonomy_df$Taxon_Label <- gsub("_$", "", taxonomy_df$Taxon_Label)
+taxonomy_df$Taxon_Label <- gsub("^_", "", taxonomy_df$Taxon_Label)
+
+# Map OTUs to taxon names
+name_map <- taxonomy_df$Taxon_Label
+names(name_map) <- rownames(taxonomy_df)
+colnames(otu) <- ifelse(colnames(otu) %in% names(name_map),
+                        name_map[colnames(otu)],
+                        colnames(otu))
+
+# Prevalence filter (optional)
+prevalence_threshold <- 0.0
+prevalent_taxa <- colnames(otu)[colSums(otu > 0) >= prevalence_threshold * nrow(otu)]
+otu_filtered <- otu[, prevalent_taxa]
+
+# Align metadata and OTU table
+shared_ids <- intersect(rownames(otu_filtered), rownames(meta))
+otu_filtered <- otu_filtered[shared_ids, , drop = FALSE]
+meta <- meta[shared_ids, , drop = FALSE]
+otu_filtered <- otu_filtered[order(rownames(otu_filtered)), ]
+meta <- meta[order(rownames(meta)), ]
+stopifnot(identical(rownames(otu_filtered), rownames(meta)))
+
+```
+
+## Setup Output and Variables
+
+```{r}
+group_var <- "Location"
+taxa_list <- unique(meta$Taxa)
+
+output_dir <- "R_output/plots_trophic_transmission"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+taxonomy_df$Taxon_Label_clean <- gsub("_", " ", taxonomy_df$Taxon_Label)
+taxa_name_lookup <- taxonomy_df$Taxon_Label_clean
+names(taxa_name_lookup) <- rownames(taxonomy_df)
+
+# Global abundance range for scaling
+rel_abund_all <- otu_filtered / rowSums(otu_filtered)
+mean_rel_abund_all <- colMeans(rel_abund_all, na.rm = TRUE)
+global_min_abund <- min(mean_rel_abund_all[mean_rel_abund_all > 0])
+global_max_abund <- max(mean_rel_abund_all)
+
+caption_text <- paste0(
+  "Bold labels: taxa present in ≥ ", label_threshold * 100, "% of both Adult and Spider samples\n",
+  "Gray labels: taxa present in ≥ ", gray_label_threshold * 100, "% of either Adult or Spider samples"
+)
+
+```
+
+## Identify trophic transmission
+
+```{r id-trophic-transmission}
+ps <- tax_glom(ps_final, taxrank = taxrank)
+# Extract OTU table safely (samples as rows)
+otu <- as.data.frame(otu_table(ps))
+if (taxa_are_rows(ps)) {
+  otu <- t(otu)
+}
+
+# Ensure numeric matrix
+otu <- as.data.frame(apply(otu, 2, as.numeric))
+rownames(otu) <- sample_names(ps)
+if (taxa_are_rows(ps)) { otu <- t(otu) }
+otu <- otu[, sapply(otu, is.numeric)]
+meta <- as(sample_data(ps), "data.frame")
+taxonomy_df <- as.data.frame(tax_table(ps))
+
+# Create taxon label
+if (taxrank == "Species") {
+  taxonomy_df$Taxon_Label <- paste(taxonomy_df$Genus, taxonomy_df$Species, sep = "_")
+} else {
+  taxonomy_df$Taxon_Label <- taxonomy_df[[taxrank]]
+}
+
+# Clean taxon labels
+taxonomy_df$Taxon_Label <- gsub(" ", "_", taxonomy_df$Taxon_Label)
+taxonomy_df$Taxon_Label <- gsub("__+", "_", taxonomy_df$Taxon_Label)
+taxonomy_df$Taxon_Label <- gsub("_$", "", taxonomy_df$Taxon_Label)
+taxonomy_df$Taxon_Label <- gsub("^_", "", taxonomy_df$Taxon_Label)
+
+# Replace OTU names
+name_map <- taxonomy_df$Taxon_Label
+names(name_map) <- rownames(taxonomy_df)
+colnames(otu) <- ifelse(colnames(otu) %in% names(name_map),
+                        name_map[colnames(otu)],
+                        colnames(otu))
+
+# Prevalence filter (optional)
+prevalence_threshold <- 0.0
+prevalent_taxa <- colnames(otu)[colSums(otu > 0) >= prevalence_threshold * nrow(otu)]
+otu_filtered <- otu[, prevalent_taxa]
+
+# Align metadata and OTU table
+shared_ids <- intersect(rownames(otu_filtered), rownames(meta))
+otu_filtered <- otu_filtered[shared_ids, , drop = FALSE]
+meta <- meta[shared_ids, , drop = FALSE]
+otu_filtered <- otu_filtered[order(rownames(otu_filtered)), ]
+meta <- meta[order(rownames(meta)), ]
+stopifnot(identical(rownames(otu_filtered), rownames(meta)))
+
+# ============================================================
+# Set up plotting
+# ============================================================
+
+# Taxa list (invertebrate groups)
+taxa_list <- unique(meta$Taxa)
+group_var <- "Location"
+
+output_trophic_dir <- "R_output/plots/Trophic_Transmission"
+if (!dir.exists(output_trophic_dir)) dir.create(output_trophic_dir, recursive = TRUE)
+
+caption_text <- paste0(
+  "Bold labels: taxa present in ≥ ", label_threshold * 100, "% of both Adult and Spider samples\n",
+  "Gray labels: taxa present in ≥ ", gray_label_threshold * 100, "% of either Adult or Spider samples"
+)
+
+taxonomy_df$Taxon_Label_clean <- gsub("_", " ", taxonomy_df$Taxon_Label)
+taxa_name_lookup <- taxonomy_df$Taxon_Label_clean
+names(taxa_name_lookup) <- rownames(taxonomy_df)
+
+# Global abundance range for legends
+rel_abund_all <- otu_filtered / rowSums(otu_filtered)
+mean_rel_abund_all <- colMeans(rel_abund_all, na.rm = TRUE)
+global_min_abund <- min(mean_rel_abund_all[mean_rel_abund_all > 0])
+global_max_abund <- max(mean_rel_abund_all)
+
+```
+
+```{r}
+for (taxon in taxa_list) {
+  message("Processing Taxa: ", taxon)
+  
+  plots_by_location <- list()
+  locations <- unique(meta[[group_var]])
+  
+  for (loc in locations) {
+    message("  Location: ", loc)
+    
+    meta_sub <- meta %>%
+      filter(Taxa == taxon, .data[[group_var]] == loc)
+    
+    # Skip if missing one of the two groups
+    if (!all(c("Adult", "Spider") %in% meta_sub$Lifestage)) {
+      message("    Skipping ", taxon, " (", loc, "): missing Adult or Spider samples.")
+      next
+    }
+    
+    otu_sub <- otu_filtered[rownames(meta_sub), , drop = FALSE]
+    
+    adult_idx <- which(meta_sub$Lifestage == "Adult")
+    spider_idx <- which(meta_sub$Lifestage == "Spider")
+    
+    n_adult <- length(adult_idx)
+    n_spider <- length(spider_idx)
+    
+    # Calculate prevalence
+    prev_adult <- colSums(otu_sub[adult_idx, ] > 0) / n_adult
+    prev_spider <- colSums(otu_sub[spider_idx, ] > 0) / n_spider
+    
+    # Mean relative abundance
+    rel_abund <- otu_sub / rowSums(otu_sub)
+    mean_rel_abund <- colMeans(rel_abund, na.rm = TRUE)
+    
+    # Data for plotting
+    plot_df <- tibble(
+      ASV = colnames(otu_sub),
+      Prevalence_Adult = prev_adult,
+      Prevalence_Spider = prev_spider,
+      Mean_Relative_Abundance = mean_rel_abund
+    ) %>%
+      mutate(
+        Taxon_Label = taxa_name_lookup[ASV],
+        Taxon_Label = ifelse(is.na(Taxon_Label), ASV, Taxon_Label),
+        Label_bold = ifelse(
+          Prevalence_Adult >= label_threshold & Prevalence_Spider >= label_threshold,
+          Taxon_Label, NA_character_),
+        Label_gray = ifelse(
+          (Prevalence_Adult >= gray_label_threshold | Prevalence_Spider >= gray_label_threshold) &
+            !(Prevalence_Adult >= label_threshold & Prevalence_Spider >= label_threshold),
+          Taxon_Label, NA_character_)
+      ) %>%
+      filter(!is.na(Mean_Relative_Abundance) & Mean_Relative_Abundance > 0)
+    
+    if (nrow(plot_df) == 0) next
+    
+    # Build plot
+    p <- ggplot(plot_df, aes(x = Prevalence_Adult, y = Prevalence_Spider)) +
+      geom_point(aes(size = Mean_Relative_Abundance, color = Mean_Relative_Abundance), alpha = 0.7) +
+      geom_text_repel(aes(label = Label_bold), size = 4, fontface = "bold", color = "black",
+                      max.overlaps = 20, force = 10, segment.size = 0.3) +
+      geom_text_repel(aes(label = Label_gray), size = 3.5, color = "grey50",
+                      max.overlaps = 20, force = 10, segment.size = 0.3) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+      scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+      scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+      scale_color_viridis_c(option = "plasma", trans = "log10", na.value = "grey50",
+                            limits = c(global_min_abund, global_max_abund), oob = scales::squish) +
+      scale_size(range = c(1, 10), limits = c(global_min_abund, global_max_abund)) +
+      labs(
+        title = paste0(taxon, " — ", loc),
+        x = "Prevalence in Adults",
+        y = ifelse(loc == locations[1], "Prevalence in Spiders", NULL),
+        caption = caption_text
+      ) +
+      theme_bw(base_size = 16) +
+      theme(
+        legend.position = "right",
+        plot.caption = element_text(size = 11, color = "grey40"),
+        axis.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(size = 14),
+        plot.title = element_text(size = 16, face = "bold")
+      )
+    
+    plots_by_location[[loc]] <- p
+  }
+  
+  if (length(plots_by_location) == 0) next
+  
+  # Combine plots side by side with shared y-axis label centered
+  combined_plot <- wrap_plots(plots_by_location, ncol = 2, guides = "collect") &
+    plot_annotation(title = paste("Trophic Transmission —", taxon)) &
+    theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      axis.title.y = element_text(size = 14, face = "bold", vjust = 1.5)
+    )
+  
+  # Save output
+  outfile <- file.path(output_trophic_dir, paste0("Trophic_Transmission_", taxon, ".pdf"))
+  ggsave(outfile, combined_plot, width = 13, height = 6)
+  message("Saved: ", outfile)
+}
+```
