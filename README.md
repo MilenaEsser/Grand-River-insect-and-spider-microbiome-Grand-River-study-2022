@@ -56,14 +56,14 @@ This repository contains the R Markdown scripts used to analyse bacterial microb
 
 | Script | Content |
 |---|---|
-| `1_Create_physeq_GrandRiver_MEsser.Rmd` | Builds phyloseq objects; quality filtering, decontam, normalization; per-sample read tracking (Table S#) |
+| `1_Create_physeq_GrandRiver_MEsser.Rmd` | Builds phyloseq objects; quality filtering, decontam, normalization|
 | `2_GrandRiverMB_alphadiversity_MEsser.Rmd` | Alpha diversity |
 | `3_GrandRiverMB_betadiversity_MEsser.Rmd` | Beta diversity (ordination, PERMANOVA) |
 | `4_GrandRiverMB_barplots_MEsser.Rmd` | Taxonomic composition bar plots |
 | `5_GrandRiverMB_MaAsLin3_MEsser.Rmd` | Differential abundance (MaAsLin3, ASV level) |
 | `5.2_GrandRiverMB_MaAsLin3_Genus_MEsser.Rmd` | Differential abundance (MaAsLin3, genus level) |
 | `10_GrandRiverMB_Relative_abundance_plot_endosymbionts...Rmd` | Endosymbiont relative abundance |
-| `11_GrandRiverMB_euler_plots_vertical_turnover.Rmd` | Larval–adult prevalence and shared ASVs (Fig. 3) |
+| `11_GrandRiverMB_euler_plots_vertical_turnover.Rmd` | Larval and and adult shared ASVs|
 | `11_GrandRiverMB_trophic_transmission.Rmd` | Taxa shared between insects and spiders |
 | `12_GrandRiverMB_picrust2_v2=3_namecorrection.Rmd` | Predicted functional profiles (PICRUSt2) |
 | `13_GrandRiverMB_picrust2_PCoA.Rmd` | Ordination of predicted functional profiles |
