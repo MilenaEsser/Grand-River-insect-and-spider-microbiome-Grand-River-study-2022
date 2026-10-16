@@ -9,7 +9,7 @@ This repository contains the R Markdown scripts used to analyse bacterial microb
 
 | Data | Location |
 |---|---|
-| Raw 16S rRNA gene sequences (FASTQ) | NCBI SRA, BioProject [PRJNAxxxxxx] |
+| Raw 16S rRNA gene sequences (FASTQ) | NCBI SRA, BioProject [PRJNA1544676] |
 | ASV table, taxonomy table, sample metadata, PICRUSt2 output | Zenodo: https://zenodo.org/records/19040149 |
 | Sample metadata, site information, water chemistry | This repository (`data/`) |
 
